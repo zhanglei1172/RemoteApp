@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">RemoteApp Host</string>
+    <string name="accessibility_service_label">RemoteApp 控制服务</string>
+    <string name="accessibility_service_description">在用户明确授权后执行远程点按和滑动操作。</string>
+</resources>

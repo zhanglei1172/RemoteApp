@@ -1,0 +1,3 @@
+<resources>
+    <!-- API 30+ screenshot capability is requested at runtime by the service. -->
+</resources>
