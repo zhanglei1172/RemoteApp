@@ -54,6 +54,7 @@ dependencies {
     implementation("io.ktor:ktor-server-cio:3.0.3")
     implementation("io.ktor:ktor-server-websockets:3.0.3")
     implementation("io.ktor:ktor-server-content-negotiation:3.0.3")
+    implementation("io.ktor:ktor-server-status-pages:3.0.3")
     implementation("io.ktor:ktor-serialization-kotlinx-json:3.0.3")
     implementation("io.ktor:ktor-http-cio:3.0.3")
 

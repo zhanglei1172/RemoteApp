@@ -1,5 +1,7 @@
 # RemoteApp 安卓被控端设计
 
+跨 Android 版本的后续改造以 [Android 兼容性增强方案](android-compatibility.md) 为准：建议统一使用 MediaProjection 截图、无障碍负责输入。该方案尚未实现；本文下述无障碍截图优先等内容属于早期设计，不代表已完成跨版本验证。
+
 ## 1. 产品边界
 
 RemoteApp 安装在一台安卓手机上。手机用户主动开启无障碍服务并启动远程控制后，局域网内的 Agent 或浏览器可以：
@@ -109,6 +111,8 @@ Manifest 需要按实际实现声明：
 }
 ```
 
+`GET /screen` 通过 `X-Screen-Revision`、`X-Screen-Width`、`X-Screen-Height`、`X-Screen-Rotation` 响应头携带截图对应的几何信息。revision 仅在尺寸或旋转变化时更新，正常画面刷新不会使输入失效。
+
 归一化坐标范围为 `[0, 1]`，以当前截图的可用显示区域为准。服务返回 `width`、`height`、旋转角度、状态栏/导航栏偏移和 `screenRevision`；客户端在发送旧 revision 时得到 `409 SCREEN_CHANGED`，避免旋转或窗口变化后误触。
 
 ## 6. HTTP 和 WebSocket API（v1）
@@ -158,25 +162,28 @@ Manifest 需要按实际实现声明：
 `GET /api/v1/stream` 使用 WebSocket。服务端发送：
 
 1. 一条 JSON 元数据：`{type:"hello", width, height, rotation, revision, format:"jpeg"}`；
-2. 后续为二进制 JPEG 帧，每帧前附一个小的 JSON 头或使用 WebSocket binary message 的 metadata 字段约定；
-3. 客户端发送 `{type:"setQuality", fps:10, jpegQuality:65}` 调整带宽。
+2. 后续每条二进制消息为一张 JPEG；
+3. 客户端发送 `{type:"setQuality", fps:10}` 调整发送频率（1-15 FPS），JPEG 质量固定为 65。
+
+握手升级前校验会话或 API Key。浏览器通过认证的 `POST /api/v1/stream-ticket` 换取有效期 30 秒、单次使用的票据，再以 `ticket` 查询参数连接；票据绑定原凭据。会话撤销、密码修改或 API Key 轮换后，相关旧连接会关闭。
 
 默认上限建议为 10 FPS、720p、JPEG 质量 65。服务端对每个连接限速和限帧，断开时释放订阅。
 
 ## 7. 配对、认证与网络暴露
 
-### 首次配对
+### 密码、配对和 API Key（当前实现）
 
 1. 默认只监听 `127.0.0.1`，用户在应用中打开“允许局域网访问”后才监听局域网地址。
-2. 应用生成一次性 6 位配对码和短时有效期（例如 5 分钟），手机页面同时显示设备名、IP、端口和二维码。
-3. 浏览器打开配对页面，提交配对码；服务端返回随机高熵 bearer token。配对码只能使用一次，失败次数限流。
-4. token 只以哈希形式存储；撤销全部会话后必须重新配对。敏感配置使用 Android Keystore 保护。
+2. 手机用户可设置 6-128 位密码，网页通过 `POST /api/v1/auth/login`（`{"password":"..."}`）取得随机 Bearer 会话。密码使用随机盐和 PBKDF2-HMAC-SHA256（100,000 次）保存于加密偏好设置，在后台线程计算以兼顾旧设备响应；失败登录递增退避 1-32 秒。
+3. 启动服务时仍提供 5 分钟有效的六位一次性配对码，兼容 `/api/v1/pairing/claim`。会话 token 只保存 SHA-256 摘要；更新密码撤销已有会话。
+4. 手机可生成、复制 256 位随机 API Key。摘要用于验证，原值存于 Android Keystore 保护的 EncryptedSharedPreferences，以便重启后再次复制。Key 不设有效期，重新生成后旧 Key 失效；清数据/卸载同样删除 Key。更改密码、撤销会话及停止服务不删除 Key。
+5. `/session/revoke` 撤销当前 Bearer 会话；`/session/revoke-all` 撤销全部会话，两者不轮换 API Key。API Key 只在手机 UI 生成或替换，不通过远程接口读取。
 
 ### 传输和访问控制
 
 - 当前实现默认使用 HTTP；手机 UI 必须显式打开局域网访问，并明确提示屏幕和 token 会以明文经过局域网。公网场景不得直接暴露端口。
 - 后续切换 HTTPS 时使用安装级证书和配对指纹；在 HTTPS 完成前，VPN 是推荐的跨网络接入方式。
-- 所有非健康接口都要求 `Authorization: Bearer <token>`；`Origin`、请求体大小、并发连接数和输入频率都做限制。
+- 除健康检查、登录/配对接口和静态网页外，API 都需要认证。Agent 可使用 `X-API-Key: <key>`、`Authorization: ApiKey <key>` 或 `Authorization: Bearer <key>`；网页使用 Bearer 会话。API 响应禁止缓存。更多来源、请求体大小、并发及输入频率限制仍属于后续硬化工作。
 - 可选的 mDNS 服务名为 `_remoteapp._tcp`，只用于发现，不能代替认证。
 - 页面和 API 同源提供，避免 CORS 成为默认配置；若 Agent 跨域调用，提供明确的 CORS allowlist。
 

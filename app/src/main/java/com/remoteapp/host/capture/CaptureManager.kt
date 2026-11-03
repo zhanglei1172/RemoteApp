@@ -15,6 +15,8 @@ import android.os.HandlerThread
 import android.content.Context
 import android.content.Intent
 import android.graphics.PixelFormat
+import android.util.DisplayMetrics
+import android.view.Display
 import com.remoteapp.host.accessibility.RemoteAccessibilityService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -38,6 +40,16 @@ class CaptureManager {
     private var virtualDisplay: android.hardware.display.VirtualDisplay? = null
     private var imageReader: ImageReader? = null
     private var projectionThread: HandlerThread? = null
+    private var displayManager: DisplayManager? = null
+    private val captureLock = Any()
+    private var geometry: Triple<Int, Int, Int>? = null
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) = Unit
+        override fun onDisplayRemoved(displayId: Int) = Unit
+        override fun onDisplayChanged(displayId: Int) {
+            if (displayId == Display.DEFAULT_DISPLAY) synchronized(captureLock) { updateProjectionDisplay() }
+        }
+    }
 
     suspend fun capture(): CapturedFrame? = withContext(Dispatchers.Default) {
         val service = RemoteAccessibilityService.instance ?: return@withContext latest
@@ -45,7 +57,9 @@ class CaptureManager {
         val bitmap = ScreenshotAwaiter.await(service) ?: return@withContext latest
         val output = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.JPEG, 65, output)
-        val frame = CapturedFrame(output.toByteArray(), bitmap.width, bitmap.height, 0, revision.incrementAndGet())
+        val rotation = (service.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
+            .getDisplay(Display.DEFAULT_DISPLAY)?.rotation?.times(90) ?: 0
+        val frame = frame(output.toByteArray(), bitmap.width, bitmap.height, rotation)
         bitmap.recycle()
         latest = frame
         frame
@@ -62,27 +76,66 @@ class CaptureManager {
     fun startMediaProjection(context: Context, resultCode: Int, data: Intent) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R || projection != null) return
         val manager = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        val metrics = context.resources.displayMetrics
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        val density = metrics.densityDpi
         projection = manager.getMediaProjection(resultCode, data)
         projectionThread = HandlerThread("remoteapp-capture").also { it.start() }
-        imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-        imageReader?.setOnImageAvailableListener({ reader ->
-            reader.acquireLatestImage()?.use { image ->
-                val jpeg = encodeMediaProjectionFrame(image, width, height) ?: return@use
-                latest = CapturedFrame(jpeg, width, height, 0, revision.incrementAndGet())
-            }
-        }, Handler(projectionThread!!.looper))
-        virtualDisplay = projection?.createVirtualDisplay(
-            "RemoteAppCapture", width, height, density,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader?.surface, null, Handler(projectionThread!!.looper)
-        )
+        displayManager = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+        val handler = Handler(projectionThread!!.looper)
+        displayManager?.registerDisplayListener(displayListener, handler)
+        synchronized(captureLock) { updateProjectionDisplay() }
     }
 
-    fun stop() {
+    private fun updateProjectionDisplay() {
+        val activeProjection = projection ?: return
+        val display = displayManager?.getDisplay(Display.DEFAULT_DISPLAY) ?: return
+        val metrics = DisplayMetrics().also(display::getRealMetrics)
+        val width = metrics.widthPixels
+        val height = metrics.heightPixels
+        val rotation = display.rotation * 90
+        val size = Triple(width, height, rotation)
+        if (geometry == size && imageReader != null) return
+        latest = null
+        val handler = Handler(projectionThread!!.looper)
+        val previousReader = imageReader
+        val newReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+        imageReader = newReader
+        newReader.setOnImageAvailableListener({ reader ->
+            synchronized(captureLock) {
+                if (reader === imageReader) reader.acquireLatestImage()?.use { image ->
+                    val jpeg = encodeMediaProjectionFrame(image, width, height) ?: return@use
+                    latest = frame(jpeg, width, height, rotation)
+                }
+            }
+        }, handler)
+        if (virtualDisplay == null) {
+            virtualDisplay = activeProjection.createVirtualDisplay(
+                "RemoteAppCapture", width, height, metrics.densityDpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                newReader.surface, null, handler
+            )
+        } else {
+            virtualDisplay?.resize(width, height, metrics.densityDpi)
+            virtualDisplay?.surface = newReader.surface
+        }
+        previousReader?.close()
+        updateGeometry(size)
+    }
+
+    @Synchronized
+    private fun updateGeometry(size: Triple<Int, Int, Int>): Long {
+        if (size != geometry) {
+            geometry = size
+            revision.incrementAndGet()
+        }
+        return revision.get()
+    }
+
+    private fun frame(jpeg: ByteArray, width: Int, height: Int, rotation: Int) = CapturedFrame(
+        jpeg, width, height, rotation, updateGeometry(Triple(width, height, rotation))
+    )
+
+    fun stop() = synchronized(captureLock) {
+        displayManager?.unregisterDisplayListener(displayListener)
+        displayManager = null
         virtualDisplay?.release()
         virtualDisplay = null
         imageReader?.close()
@@ -91,6 +144,7 @@ class CaptureManager {
         projection = null
         projectionThread?.quitSafely()
         projectionThread = null
+        latest = null
     }
 
     private fun encodeMediaProjectionFrame(image: Image, width: Int, height: Int): ByteArray? {

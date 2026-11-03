@@ -5,12 +5,15 @@ import android.os.Build
 import android.util.DisplayMetrics
 import com.remoteapp.host.accessibility.RemoteAccessibilityService
 import com.remoteapp.host.capture.CaptureManager
+import com.remoteapp.host.auth.Credential
 import com.remoteapp.host.domain.DeviceStatus
 import com.remoteapp.host.domain.ErrorResponse
 import com.remoteapp.host.domain.HealthResponse
 import com.remoteapp.host.domain.InputValidation
 import com.remoteapp.host.domain.PairingRequest
 import com.remoteapp.host.domain.PairingResponse
+import com.remoteapp.host.domain.PasswordLoginRequest
+import com.remoteapp.host.domain.StreamTicketResponse
 import com.remoteapp.host.domain.QualityRequest
 import com.remoteapp.host.domain.StreamHello
 import com.remoteapp.host.domain.SwipeRequest
@@ -20,14 +23,18 @@ import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
+import io.ktor.server.application.ApplicationCallPipeline
 import io.ktor.server.application.call
 import io.ktor.server.application.install
 import io.ktor.server.cio.CIO
-import io.ktor.server.engine.ApplicationEngine
 import io.ktor.server.engine.EmbeddedServer
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.server.plugins.BadRequestException
+import io.ktor.server.plugins.UnsupportedMediaTypeException
+import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.request.receive
+import io.ktor.server.request.path
 import io.ktor.server.response.respond
 import io.ktor.server.response.respondBytes
 import io.ktor.server.routing.get
@@ -36,12 +43,16 @@ import io.ktor.server.routing.routing
 import io.ktor.server.websocket.webSocket
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.websocket.Frame
+import io.ktor.websocket.CloseReason
+import io.ktor.util.AttributeKey
 import io.ktor.server.websocket.WebSockets
 import io.ktor.websocket.close
 import io.ktor.websocket.readText
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import java.util.UUID
 import kotlin.math.roundToInt
@@ -51,7 +62,7 @@ class HttpServer(
     private val capture: CaptureManager,
     private val port: Int = DEFAULT_PORT
 ) {
-    private val codec = Json { ignoreUnknownKeys = true }
+    private val codec = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     private var engine: EmbeddedServer<*, *>? = null
     private var bindLan: Boolean = false
 
@@ -70,7 +81,28 @@ class HttpServer(
 
     private fun Application.configureRoutes() {
         install(ContentNegotiation) { json(codec) }
+        install(StatusPages) {
+            exception<BadRequestException> { call, _ ->
+                call.respondError(HttpStatusCode.BadRequest, "INVALID_REQUEST", "Request body must be valid JSON matching the API schema")
+            }
+            exception<UnsupportedMediaTypeException> { call, _ ->
+                call.respondError(HttpStatusCode.UnsupportedMediaType, "UNSUPPORTED_MEDIA_TYPE", "Use Content-Type: application/json")
+            }
+        }
         install(WebSockets)
+        intercept(ApplicationCallPipeline.Plugins) {
+            if (call.request.path().startsWith("/api/")) {
+                call.response.headers.append(HttpHeaders.CacheControl, "no-store")
+            }
+            if (call.request.path() == "/api/v1/stream") {
+                val credential = call.credential() ?: RemoteRuntime.pairingManager
+                    .consumeStreamTicket(call.request.queryParameters["ticket"])
+                if (credential == null) {
+                    call.respondError(HttpStatusCode.Unauthorized, "UNAUTHORIZED", "A valid session token or API key is required")
+                    finish()
+                } else call.attributes.put(streamCredential, credential)
+            }
+        }
         routing {
             get("/") { call.respondAsset("web/index.html", ContentType.Text.Html) }
             get("/app.js") { call.respondAsset("web/app.js", ContentType.Application.JavaScript) }
@@ -89,6 +121,10 @@ class HttpServer(
                 if (frame == null) {
                     call.respondError(HttpStatusCode.ServiceUnavailable, "CAPTURE_UNAVAILABLE", "No screenshot is available")
                 } else {
+                    call.response.headers.append("X-Screen-Revision", frame.revision.toString())
+                    call.response.headers.append("X-Screen-Width", frame.width.toString())
+                    call.response.headers.append("X-Screen-Height", frame.height.toString())
+                    call.response.headers.append("X-Screen-Rotation", frame.rotation.toString())
                     call.respondBytes(frame.jpeg, ContentType.Image.JPEG)
                 }
             }
@@ -100,6 +136,22 @@ class HttpServer(
                 } else {
                     call.respond(PairingResponse(token, 0))
                 }
+            }
+            post("/api/v1/auth/login") {
+                val request = call.receive<PasswordLoginRequest>()
+                val token = withContext(Dispatchers.IO) { RemoteRuntime.pairingManager.login(request.password) }
+                if (token == null) {
+                    call.respondError(HttpStatusCode.Unauthorized, "AUTH_FAILED", "The password is invalid or login is temporarily rate limited")
+                } else {
+                    call.respond(PairingResponse(token, 0))
+                }
+            }
+            post("/api/v1/stream-ticket") {
+                if (!call.authorized()) return@post
+                val credential = call.credential() ?: return@post
+                val ticket = runCatching { RemoteRuntime.pairingManager.issueStreamTicket(credential) }.getOrNull()
+                if (ticket == null) call.respondError(HttpStatusCode.TooManyRequests, "TICKET_UNAVAILABLE", "Retry obtaining a stream ticket")
+                else call.respond(StreamTicketResponse(ticket))
             }
             post("/api/v1/input/tap") {
                 if (!call.authorized()) return@post
@@ -151,7 +203,10 @@ class HttpServer(
                 call.respond(mapOf("revoked" to true))
             }
             webSocket("/api/v1/stream") {
-                if (!call.authorized()) return@webSocket
+                val credential = call.attributes.getOrNull(streamCredential) ?: run {
+                    close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "Authentication required"))
+                    return@webSocket
+                }
                 var fps = 10
                 val first = capture.capture() ?: capture.latestFrame()
                 if (first == null) {
@@ -173,9 +228,23 @@ class HttpServer(
                     }
                 }
                 try {
+                    var lastRevision = first.revision
                     while (isActive) {
+                        if (!RemoteRuntime.pairingManager.isValid(credential)) {
+                            close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "Credential revoked"))
+                            break
+                        }
                         val frame = capture.capture() ?: capture.latestFrame()
-                        if (frame != null) send(Frame.Binary(true, frame.jpeg))
+                        if (frame != null) {
+                            if (frame.revision != lastRevision) {
+                                send(Frame.Text(codec.encodeToString(StreamHello.serializer(), StreamHello(
+                                    width = frame.width, height = frame.height,
+                                    rotation = frame.rotation, revision = frame.revision
+                                ))))
+                                lastRevision = frame.revision
+                            }
+                            send(Frame.Binary(true, frame.jpeg))
+                        }
                         delay(1000L / fps)
                     }
                 } finally {
@@ -186,13 +255,16 @@ class HttpServer(
     }
 
     private suspend fun io.ktor.server.application.ApplicationCall.authorized(): Boolean {
-        if (RemoteRuntime.pairingManager.isAuthorized(bearerToken())) return true
-        respondError(HttpStatusCode.Unauthorized, "UNAUTHORIZED", "A valid bearer token is required")
+        if (credential() != null) return true
+        respondError(HttpStatusCode.Unauthorized, "UNAUTHORIZED", "A valid session token or API key is required")
         return false
     }
 
+    private fun io.ktor.server.application.ApplicationCall.credential(): Credential? =
+        RemoteRuntime.pairingManager.credential(request.headers[HttpHeaders.Authorization], request.headers["X-API-Key"])
+
     private fun io.ktor.server.application.ApplicationCall.bearerToken(): String? =
-        request.headers[HttpHeaders.Authorization]?.removePrefix("Bearer ")?.trim()
+        credential()?.takeUnless { it.apiKey }?.value
 
     private suspend fun io.ktor.server.application.ApplicationCall.respondError(status: HttpStatusCode, error: String, message: String) {
         respond(status, ErrorResponse(error, message, UUID.randomUUID().toString()))
@@ -222,7 +294,8 @@ class HttpServer(
             respondError(HttpStatusCode.BadRequest, "INVALID_COORDINATE", "Coordinates must be normalized values between 0 and 1")
             return null
         }
-        return (x * current.width).roundToInt() to (y * current.height).roundToInt()
+        return (x * current.width).roundToInt().coerceIn(0, current.width - 1) to
+            (y * current.height).roundToInt().coerceIn(0, current.height - 1)
     }
 
     private fun deviceStatus(): DeviceStatus {
@@ -243,5 +316,8 @@ class HttpServer(
         )
     }
 
-    companion object { const val DEFAULT_PORT = 8765 }
+    companion object {
+        const val DEFAULT_PORT = 8765
+        private val streamCredential = AttributeKey<Credential>("stream-credential")
+    }
 }

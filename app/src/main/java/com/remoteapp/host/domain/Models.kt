@@ -58,6 +58,12 @@ data class SystemActionRequest(val action: String)
 data class PairingRequest(val code: String)
 
 @Serializable
+data class PasswordLoginRequest(val password: String)
+
+@Serializable
+data class StreamTicketResponse(val ticket: String, val expiresInSeconds: Long = 30)
+
+@Serializable
 data class PairingResponse(val token: String, val expiresInSeconds: Long)
 
 @Serializable

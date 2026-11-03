@@ -93,6 +93,8 @@ p { line-height: 1.5; }
 
 #pair { min-width: 92px; }
 #pairMessage { min-height: 1.5em; margin: 10px 0 0; color: #58657d; }
+#loginMessage { min-height: 1.5em; margin: 10px 0 0; color: #58657d; }
+summary { min-height: 44px; padding: 12px 0; cursor: pointer; }
 
 .toolbar {
   display: grid;
@@ -106,7 +108,7 @@ p { line-height: 1.5; }
 
 #screen {
   display: block;
-  width: 100%;
+  width: auto;
   max-width: 100%;
   height: auto;
   margin: 16px auto 0;

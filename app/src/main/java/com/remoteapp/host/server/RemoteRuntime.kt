@@ -5,6 +5,8 @@ import android.content.Intent
 import androidx.core.content.ContextCompat
 import com.remoteapp.host.auth.PairingManager
 import com.remoteapp.host.capture.CaptureManager
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 object RemoteRuntime {
     const val ACTION_START = "com.remoteapp.host.START"
@@ -12,6 +14,8 @@ object RemoteRuntime {
     private var applicationContext: Context? = null
     @Volatile var server: HttpServer? = null
         private set
+    private val mutableRunning = MutableStateFlow(false)
+    val running = mutableRunning.asStateFlow()
     @Volatile var lanEnabled: Boolean = false
         private set
     val pairingManager: PairingManager by lazy {
@@ -48,7 +52,35 @@ object RemoteRuntime {
         return pairingManager.createPairingCode()
     }
 
-    fun setServer(value: HttpServer?) { server = value }
+    fun setPassword(context: Context, password: String): Boolean {
+        applicationContext = context.applicationContext
+        return pairingManager.setPassword(password)
+    }
+
+    fun isPasswordConfigured(context: Context): Boolean {
+        applicationContext = context.applicationContext
+        return pairingManager.isPasswordConfigured()
+    }
+
+    fun hasApiKey(context: Context): Boolean {
+        applicationContext = context.applicationContext
+        return pairingManager.hasApiKey()
+    }
+
+    fun generateApiKey(context: Context): String {
+        applicationContext = context.applicationContext
+        return pairingManager.generateApiKey()
+    }
+
+    fun currentApiKey(context: Context): String? {
+        applicationContext = context.applicationContext
+        return pairingManager.currentApiKey()
+    }
+
+    fun setServer(value: HttpServer?) {
+        server = value
+        mutableRunning.value = value != null
+    }
 
     private fun requireContext(): Context = applicationContext
         ?: error("RemoteRuntime has not been initialized")
