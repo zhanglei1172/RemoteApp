@@ -10,6 +10,13 @@ data class ErrorResponse(
 )
 
 @Serializable
+data class HealthResponse(
+    val ok: Boolean,
+    val server: String,
+    val port: Int
+)
+
+@Serializable
 data class DeviceStatus(
     val deviceName: String,
     val appVersion: String,

@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.ColorSpace
 import android.hardware.HardwareBuffer
 import android.hardware.display.DisplayManager
+import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -33,7 +34,7 @@ data class CapturedFrame(
 class CaptureManager {
     private val revision = AtomicLong(0)
     @Volatile private var latest: CapturedFrame? = null
-    private var projection: MediaProjection? = null
+    @Volatile private var projection: MediaProjection? = null
     private var virtualDisplay: android.hardware.display.VirtualDisplay? = null
     private var imageReader: ImageReader? = null
     private var projectionThread: HandlerThread? = null
@@ -52,6 +53,12 @@ class CaptureManager {
 
     fun latestFrame(): CapturedFrame? = latest
 
+    fun captureMode(): String = when {
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && RemoteAccessibilityService.connected.get() -> "accessibility"
+        projection != null -> "media_projection"
+        else -> "unavailable"
+    }
+
     fun startMediaProjection(context: Context, resultCode: Int, data: Intent) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R || projection != null) return
         val manager = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -64,15 +71,8 @@ class CaptureManager {
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
         imageReader?.setOnImageAvailableListener({ reader ->
             reader.acquireLatestImage()?.use { image ->
-                val plane = image.planes.firstOrNull() ?: return@use
-                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                val buffer = plane.buffer
-                buffer.rewind()
-                bitmap.copyPixelsFromBuffer(buffer)
-                val output = ByteArrayOutputStream()
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 65, output)
-                latest = CapturedFrame(output.toByteArray(), width, height, 0, revision.incrementAndGet())
-                bitmap.recycle()
+                val jpeg = encodeMediaProjectionFrame(image, width, height) ?: return@use
+                latest = CapturedFrame(jpeg, width, height, 0, revision.incrementAndGet())
             }
         }, Handler(projectionThread!!.looper))
         virtualDisplay = projection?.createVirtualDisplay(
@@ -91,6 +91,38 @@ class CaptureManager {
         projection = null
         projectionThread?.quitSafely()
         projectionThread = null
+    }
+
+    private fun encodeMediaProjectionFrame(image: Image, width: Int, height: Int): ByteArray? {
+        val plane = image.planes.firstOrNull() ?: return null
+        val pixelStride = plane.pixelStride
+        val rowStride = plane.rowStride
+        if (pixelStride != BYTES_PER_RGBA_PIXEL || rowStride < width * pixelStride) return null
+
+        val rowPadding = rowStride - width * pixelStride
+        val paddedWidth = width + rowPadding / pixelStride
+        val buffer = plane.buffer
+        buffer.rewind()
+        val paddedBitmap = Bitmap.createBitmap(paddedWidth, height, Bitmap.Config.ARGB_8888)
+        return try {
+            paddedBitmap.copyPixelsFromBuffer(buffer)
+            val croppedBitmap = if (paddedWidth == width) paddedBitmap else
+                Bitmap.createBitmap(paddedBitmap, 0, 0, width, height)
+            try {
+                ByteArrayOutputStream().use { output ->
+                    croppedBitmap.compress(Bitmap.CompressFormat.JPEG, 65, output)
+                    output.toByteArray()
+                }
+            } finally {
+                if (croppedBitmap !== paddedBitmap) croppedBitmap.recycle()
+            }
+        } finally {
+            paddedBitmap.recycle()
+        }
+    }
+
+    companion object {
+        private const val BYTES_PER_RGBA_PIXEL = 4
     }
 }
 

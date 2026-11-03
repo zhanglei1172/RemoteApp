@@ -7,6 +7,7 @@ import com.remoteapp.host.accessibility.RemoteAccessibilityService
 import com.remoteapp.host.capture.CaptureManager
 import com.remoteapp.host.domain.DeviceStatus
 import com.remoteapp.host.domain.ErrorResponse
+import com.remoteapp.host.domain.HealthResponse
 import com.remoteapp.host.domain.InputValidation
 import com.remoteapp.host.domain.PairingRequest
 import com.remoteapp.host.domain.PairingResponse
@@ -76,7 +77,7 @@ class HttpServer(
             get("/styles.css") { call.respondAsset("web/styles.css", ContentType.Text.CSS) }
 
             get("/api/v1/health") {
-                call.respond(mapOf("ok" to true, "server" to "remoteapp", "port" to port))
+                call.respond(HealthResponse(ok = true, server = "remoteapp", port = port))
             }
             get("/api/v1/device") {
                 if (!call.authorized()) return@get
@@ -238,7 +239,7 @@ class HttpServer(
             height = frame?.height ?: metrics.heightPixels,
             rotation = frame?.rotation ?: context.resources.configuration.orientation,
             screenRevision = frame?.revision ?: 0,
-            captureMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) "accessibility" else "unavailable"
+            captureMode = capture.captureMode()
         )
     }
 
