@@ -8,12 +8,20 @@ import com.remoteapp.host.capture.CaptureManager
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
+enum class HostPhase { IDLE, AWAITING_CONSENT, STARTING, RUNNING, STOPPING, ERROR }
+
+data class HostState(val phase: HostPhase = HostPhase.IDLE, val message: String? = null) {
+    val busy: Boolean get() = phase in setOf(HostPhase.AWAITING_CONSENT, HostPhase.STARTING, HostPhase.STOPPING)
+}
+
 object RemoteRuntime {
     const val ACTION_START = "com.remoteapp.host.START"
     const val ACTION_STOP = "com.remoteapp.host.STOP"
     private var applicationContext: Context? = null
     @Volatile var server: HttpServer? = null
         private set
+    private val mutableState = MutableStateFlow(HostState())
+    val state = mutableState.asStateFlow()
     private val mutableRunning = MutableStateFlow(false)
     val running = mutableRunning.asStateFlow()
     @Volatile var lanEnabled: Boolean = false
@@ -23,28 +31,44 @@ object RemoteRuntime {
     }
     val captureManager: CaptureManager by lazy { CaptureManager() }
 
-    fun start(context: Context, allowLan: Boolean) {
-        applicationContext = context.applicationContext
-        lanEnabled = allowLan
-        val intent = Intent(context, RemoteControlForegroundService::class.java)
-            .setAction(ACTION_START)
-            .putExtra(EXTRA_ALLOW_LAN, allowLan)
-        ContextCompat.startForegroundService(context, intent)
-    }
+    fun awaitingConsent() { updateState(HostPhase.AWAITING_CONSENT) }
+    fun updateState(phase: HostPhase, message: String? = null) { mutableState.value = HostState(phase, message) }
 
     fun startWithProjection(context: Context, allowLan: Boolean, resultCode: Int, data: Intent) {
+        if (server != null || state.value.phase == HostPhase.STARTING) return
         applicationContext = context.applicationContext
         lanEnabled = allowLan
+        updateState(HostPhase.STARTING)
         val intent = Intent(context, RemoteControlForegroundService::class.java)
             .setAction(ACTION_START)
             .putExtra(EXTRA_ALLOW_LAN, allowLan)
             .putExtra(EXTRA_RESULT_CODE, resultCode)
             .putExtra(EXTRA_RESULT_DATA, data)
-        ContextCompat.startForegroundService(context, intent)
+        try {
+            ContextCompat.startForegroundService(context, intent)
+        } catch (_: Exception) {
+            updateState(HostPhase.ERROR, "无法启动前台服务，请回到应用重新授权。")
+        }
     }
 
     fun stop(context: Context) {
-        context.stopService(Intent(context, RemoteControlForegroundService::class.java))
+        captureManager.invalidate()
+        updateState(HostPhase.STOPPING)
+        if (!context.stopService(Intent(context, RemoteControlForegroundService::class.java))) {
+            setServer(null)
+            updateState(HostPhase.IDLE)
+        }
+    }
+
+    fun accessibilityDisconnected() {
+        if (state.value.phase !in setOf(HostPhase.STARTING, HostPhase.RUNNING)) return
+        failSession("无障碍服务已断开，请重新启用后启动。")
+    }
+
+    fun failSession(message: String) {
+        captureManager.invalidate()
+        updateState(HostPhase.ERROR, message)
+        applicationContext?.let { it.stopService(Intent(it, RemoteControlForegroundService::class.java)) }
     }
 
     fun createPairingCode(context: Context): String {
@@ -80,6 +104,7 @@ object RemoteRuntime {
     fun setServer(value: HttpServer?) {
         server = value
         mutableRunning.value = value != null
+        if (value != null) updateState(HostPhase.RUNNING)
     }
 
     private fun requireContext(): Context = applicationContext

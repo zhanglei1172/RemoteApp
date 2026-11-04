@@ -1,205 +1,236 @@
 package com.remoteapp.host.capture
 
-import android.accessibilityservice.AccessibilityService
+import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.ColorSpace
-import android.hardware.HardwareBuffer
+import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
 import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
-import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
-import android.content.Context
-import android.content.Intent
-import android.graphics.PixelFormat
-import android.util.DisplayMetrics
+import android.os.SystemClock
 import android.view.Display
-import com.remoteapp.host.accessibility.RemoteAccessibilityService
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
+import com.remoteapp.host.platform.PlatformCapabilities
 import java.io.ByteArrayOutputStream
-import java.util.concurrent.atomic.AtomicLong
-import kotlin.coroutines.resume
+import java.nio.ByteBuffer
+import java.security.SecureRandom
 
+/** One producer, bounded native buffers and one shared encoded frame for every client. */
 data class CapturedFrame(
     val jpeg: ByteArray,
-    val width: Int,
-    val height: Int,
-    val rotation: Int,
-    val revision: Long
-)
+    val geometry: FrameGeometry,
+    val sequence: Long,
+    val capturedAtMs: Long,
+) {
+    val width get() = geometry.width
+    val height get() = geometry.height
+    val rotation get() = geometry.rotation
+    val revision get() = geometry.revision
+}
 
 class CaptureManager {
-    private val revision = AtomicLong(0)
+    private val lock = Any()
     @Volatile private var latest: CapturedFrame? = null
-    @Volatile private var projection: MediaProjection? = null
-    private var virtualDisplay: android.hardware.display.VirtualDisplay? = null
-    private var imageReader: ImageReader? = null
-    private var projectionThread: HandlerThread? = null
+    @Volatile private var active = false
+    private var projection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var reader: ImageReader? = null
+    private var thread: HandlerThread? = null
+    private var handler: Handler? = null
     private var displayManager: DisplayManager? = null
-    private val captureLock = Any()
-    private var geometry: Triple<Int, Int, Int>? = null
+    private var context: Context? = null
+    private var geometry: FrameGeometry? = null
+    private var revision = 0L
+    private var sequence = 0L
+    private var bitmap: Bitmap? = null
+    private var packedPixels: ByteBuffer? = null
+    private var encodePending = false
+    private var lastEncodedAt = 0L
+    private var onReady: (() -> Unit)? = null
+    private var onFailure: ((String) -> Unit)? = null
+    private var firstFrame = false
+    private val callback = object : MediaProjection.Callback() {
+        override fun onStop() = fail("屏幕共享已被系统停止，请重新授权。")
+        override fun onCapturedContentResize(width: Int, height: Int) {
+            // Display rotation notifications and capture notifications may arrive in either order.
+            handler?.postDelayed({
+                guarded {
+                    val source = PlatformCapabilities.displayGeometry(context ?: return@guarded)
+                    if (width != source.width || height != source.height) {
+                        fail("当前共享范围不是完整屏幕，请重新选择整屏共享。")
+                    } else updateDisplay()
+                }
+            }, 300)
+        }
+    }
     private val displayListener = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) = Unit
-        override fun onDisplayRemoved(displayId: Int) = Unit
+        override fun onDisplayRemoved(displayId: Int) {
+            if (displayId == Display.DEFAULT_DISPLAY) fail("被控显示器已断开。")
+        }
         override fun onDisplayChanged(displayId: Int) {
-            if (displayId == Display.DEFAULT_DISPLAY) synchronized(captureLock) { updateProjectionDisplay() }
+            if (displayId == Display.DEFAULT_DISPLAY) guarded { updateDisplay() }
         }
     }
 
-    suspend fun capture(): CapturedFrame? = withContext(Dispatchers.Default) {
-        val service = RemoteAccessibilityService.instance ?: return@withContext latest
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return@withContext latest
-        val bitmap = ScreenshotAwaiter.await(service) ?: return@withContext latest
-        val output = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 65, output)
-        val rotation = (service.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
-            .getDisplay(Display.DEFAULT_DISPLAY)?.rotation?.times(90) ?: 0
-        val frame = frame(output.toByteArray(), bitmap.width, bitmap.height, rotation)
-        bitmap.recycle()
-        latest = frame
-        frame
+    fun latestFrame(): CapturedFrame? = if (active) latest else null
+    suspend fun capture(): CapturedFrame? = latestFrame()
+    fun captureMode(): String = if (active) "media_projection" else "unavailable"
+    fun captureState(): String = when {
+        !active -> "unavailable"
+        latest == null -> "starting"
+        else -> "ready"
     }
 
-    fun latestFrame(): CapturedFrame? = latest
-
-    fun captureMode(): String = when {
-        Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && RemoteAccessibilityService.connected.get() -> "accessibility"
-        projection != null -> "media_projection"
-        else -> "unavailable"
+    fun startMediaProjection(
+        context: Context,
+        resultCode: Int,
+        data: Intent,
+        onReady: () -> Unit,
+        onFailure: (String) -> Unit,
+    ) = synchronized(lock) {
+        check(!active && projection == null) { "A capture session is already active" }
+        this.context = context.applicationContext
+        this.onReady = onReady
+        this.onFailure = onFailure
+        firstFrame = false
+        sequence = 0
+        // Keep revisions exact in JavaScript and distinct across process/session restarts.
+        revision = SecureRandom().nextLong().ushr(12)
+        active = true
+        thread = HandlerThread("remoteapp-capture").also { it.start() }
+        handler = Handler(thread!!.looper)
+        try {
+            projection = context.getSystemService(MediaProjectionManager::class.java).getMediaProjection(resultCode, data)
+                ?: error("Screen capture permission is unavailable")
+            projection!!.registerCallback(callback, handler)
+            displayManager = context.getSystemService(DisplayManager::class.java)
+            displayManager!!.registerDisplayListener(displayListener, handler)
+            updateDisplay()
+            handler!!.postDelayed({ if (active && !firstFrame) fail("未收到屏幕画面，请检查录屏授权后重试。") }, 10_000)
+        } catch (error: Exception) {
+            stop()
+            throw error
+        }
     }
 
-    fun startMediaProjection(context: Context, resultCode: Int, data: Intent) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R || projection != null) return
-        val manager = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        projection = manager.getMediaProjection(resultCode, data)
-        projectionThread = HandlerThread("remoteapp-capture").also { it.start() }
-        displayManager = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
-        val handler = Handler(projectionThread!!.looper)
-        displayManager?.registerDisplayListener(displayListener, handler)
-        synchronized(captureLock) { updateProjectionDisplay() }
+    private fun guarded(block: () -> Unit) {
+        synchronized(lock) {
+            if (!active) return
+            try { block() } catch (_: Exception) { fail("屏幕捕获异常，请重新启动服务。") }
+            catch (_: OutOfMemoryError) { fail("屏幕捕获内存不足，请关闭其他应用后重试。") }
+        }
     }
 
-    private fun updateProjectionDisplay() {
-        val activeProjection = projection ?: return
-        val display = displayManager?.getDisplay(Display.DEFAULT_DISPLAY) ?: return
-        val metrics = DisplayMetrics().also(display::getRealMetrics)
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        val rotation = display.rotation * 90
-        val size = Triple(width, height, rotation)
-        if (geometry == size && imageReader != null) return
+    private fun updateDisplay() {
+        val source = PlatformCapabilities.displayGeometry(context ?: return)
+        val (width, height) = FrameGeometry.encodedSize(source.width, source.height)
+        val previous = geometry
+        if (previous?.sourceWidth == source.width && previous.sourceHeight == source.height &&
+            previous.rotation == source.rotation) return
         latest = null
-        val handler = Handler(projectionThread!!.looper)
-        val previousReader = imageReader
+        geometry = FrameGeometry(source.width, source.height, width, height, source.rotation, ++revision)
+        val previousReader = reader
         val newReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-        imageReader = newReader
-        newReader.setOnImageAvailableListener({ reader ->
-            synchronized(captureLock) {
-                if (reader === imageReader) reader.acquireLatestImage()?.use { image ->
-                    val jpeg = encodeMediaProjectionFrame(image, width, height) ?: return@use
-                    latest = frame(jpeg, width, height, rotation)
-                }
+        reader = newReader
+        encodePending = false
+        bitmap?.recycle()
+        bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        packedPixels = ByteBuffer.allocateDirect(width * height * 4)
+        newReader.setOnImageAvailableListener({ available ->
+            guarded {
+                if (available !== reader || encodePending) return@guarded
+                encodePending = true
+                handler!!.postDelayed({
+                    guarded {
+                        if (available !== reader) return@guarded
+                        encodePending = false
+                        available.acquireLatestImage()?.use { image -> encode(image) }
+                    }
+                }, maxOf(0, FRAME_INTERVAL_MS - (SystemClock.elapsedRealtime() - lastEncodedAt)))
             }
         }, handler)
         if (virtualDisplay == null) {
-            virtualDisplay = activeProjection.createVirtualDisplay(
-                "RemoteAppCapture", width, height, metrics.densityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                newReader.surface, null, handler
+            virtualDisplay = projection!!.createVirtualDisplay(
+                "RemoteAppCapture", width, height, source.densityDpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, newReader.surface, null, handler,
             )
         } else {
-            virtualDisplay?.resize(width, height, metrics.densityDpi)
-            virtualDisplay?.surface = newReader.surface
+            virtualDisplay!!.resize(width, height, source.densityDpi)
+            virtualDisplay!!.surface = newReader.surface
         }
         previousReader?.close()
-        updateGeometry(size)
     }
 
-    @Synchronized
-    private fun updateGeometry(size: Triple<Int, Int, Int>): Long {
-        if (size != geometry) {
-            geometry = size
-            revision.incrementAndGet()
+    private fun encode(image: Image) {
+        val current = geometry ?: return
+        val plane = image.planes.firstOrNull() ?: return
+        check(plane.pixelStride == 4 && plane.rowStride >= current.width * 4)
+        val input = plane.buffer.duplicate()
+        val packed = packedPixels!!
+        packed.clear()
+        // The last row need not include padding; do not copy padding into the screenshot.
+        for (row in 0 until current.height) {
+            input.limit(input.capacity())
+            input.position(row * plane.rowStride)
+            input.limit(input.position() + current.width * 4)
+            packed.put(input)
         }
-        return revision.get()
+        packed.flip()
+        bitmap!!.copyPixelsFromBuffer(packed)
+        val jpeg = ByteArrayOutputStream().use {
+            check(bitmap!!.compress(Bitmap.CompressFormat.JPEG, 65, it))
+            it.toByteArray()
+        }
+        lastEncodedAt = SystemClock.elapsedRealtime()
+        latest = CapturedFrame(jpeg, current, ++sequence, lastEncodedAt)
+        if (!firstFrame) {
+            firstFrame = true
+            onReady?.invoke()
+        }
     }
 
-    private fun frame(jpeg: ByteArray, width: Int, height: Int, rotation: Int) = CapturedFrame(
-        jpeg, width, height, rotation, updateGeometry(Triple(width, height, rotation))
-    )
+    /** Immediately stop exposing old frames before asynchronous service cleanup. */
+    fun invalidate() { active = false; latest = null }
 
-    fun stop() = synchronized(captureLock) {
+    private fun fail(message: String) {
+        val notify = synchronized(lock) {
+            if (!active) return
+            invalidate()
+            onFailure
+        }
+        notify?.invoke(message)
+    }
+
+    fun stop() = synchronized(lock) {
+        invalidate()
+        onReady = null
+        onFailure = null
+        handler?.removeCallbacksAndMessages(null)
         displayManager?.unregisterDisplayListener(displayListener)
         displayManager = null
+        projection?.unregisterCallback(callback)
         virtualDisplay?.release()
         virtualDisplay = null
-        imageReader?.close()
-        imageReader = null
+        reader?.close()
+        reader = null
         projection?.stop()
         projection = null
-        projectionThread?.quitSafely()
-        projectionThread = null
-        latest = null
+        bitmap?.recycle()
+        bitmap = null
+        packedPixels = null
+        geometry = null
+        context = null
+        thread?.quitSafely()
+        thread = null
+        handler = null
+        encodePending = false
+        lastEncodedAt = 0
     }
 
-    private fun encodeMediaProjectionFrame(image: Image, width: Int, height: Int): ByteArray? {
-        val plane = image.planes.firstOrNull() ?: return null
-        val pixelStride = plane.pixelStride
-        val rowStride = plane.rowStride
-        if (pixelStride != BYTES_PER_RGBA_PIXEL || rowStride < width * pixelStride) return null
-
-        val rowPadding = rowStride - width * pixelStride
-        val paddedWidth = width + rowPadding / pixelStride
-        val buffer = plane.buffer
-        buffer.rewind()
-        val paddedBitmap = Bitmap.createBitmap(paddedWidth, height, Bitmap.Config.ARGB_8888)
-        return try {
-            paddedBitmap.copyPixelsFromBuffer(buffer)
-            val croppedBitmap = if (paddedWidth == width) paddedBitmap else
-                Bitmap.createBitmap(paddedBitmap, 0, 0, width, height)
-            try {
-                ByteArrayOutputStream().use { output ->
-                    croppedBitmap.compress(Bitmap.CompressFormat.JPEG, 65, output)
-                    output.toByteArray()
-                }
-            } finally {
-                if (croppedBitmap !== paddedBitmap) croppedBitmap.recycle()
-            }
-        } finally {
-            paddedBitmap.recycle()
-        }
-    }
-
-    companion object {
-        private const val BYTES_PER_RGBA_PIXEL = 4
-    }
-}
-
-private object ScreenshotAwaiter {
-    suspend fun await(service: AccessibilityService): Bitmap? = suspendCancellableCoroutine { continuation ->
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            continuation.resume(null)
-            return@suspendCancellableCoroutine
-        }
-        service.takeScreenshot(0, service.mainExecutor, object : AccessibilityService.TakeScreenshotCallback {
-            override fun onSuccess(screenshot: AccessibilityService.ScreenshotResult) {
-                val buffer: HardwareBuffer = screenshot.hardwareBuffer
-                val hardwareBitmap = Bitmap.wrapHardwareBuffer(
-                    buffer,
-                    screenshot.colorSpace ?: ColorSpace.get(ColorSpace.Named.SRGB)
-                )
-                buffer.close()
-                val softwareBitmap = hardwareBitmap?.copy(Bitmap.Config.ARGB_8888, false)
-                hardwareBitmap?.recycle()
-                continuation.resume(softwareBitmap)
-            }
-
-            override fun onFailure(errorCode: Int) = continuation.resume(null)
-        })
-    }
+    companion object { const val FRAME_INTERVAL_MS = 200L }
 }

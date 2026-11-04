@@ -1,0 +1,4 @@
+interface:
+  display_name: "RemoteApp 手机控制"
+  short_description: "根据手机 IP 和端口，通过 RemoteApp API 截图、查看画面流并执行控制任务"
+  default_prompt: "使用 $remoteapp-control 连接我提供的手机 IP 和端口，检查状态并通过截图和 API 完成手机操作。"

@@ -10,13 +10,14 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PersistableBundle
 import android.widget.Toast
-import android.media.projection.MediaProjectionManager
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -45,14 +46,24 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import java.net.NetworkInterface
+import java.net.Inet4Address
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.remoteapp.host.accessibility.RemoteAccessibilityService
+import com.remoteapp.host.server.HostPhase
+import com.remoteapp.host.platform.PlatformCapabilities
 import com.remoteapp.host.server.RemoteRuntime
 
 class MainActivity : ComponentActivity() {
     private var accessibilityEnabled by mutableStateOf(false)
+    private var addresses by mutableStateOf("")
+    private var hostBusy by mutableStateOf(false)
+    private var hostMessage by mutableStateOf<String?>(null)
     private var serverRunning by mutableStateOf(false)
     private var lanEnabled by mutableStateOf(false)
     private var pairingCode by mutableStateOf<String?>(null)
@@ -70,18 +81,22 @@ class MainActivity : ComponentActivity() {
     private val projectionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == RESULT_OK && result.data != null) {
             RemoteRuntime.startWithProjection(this, pendingLanEnabled, result.resultCode, result.data!!)
-            serverRunning = true
-        }
+        } else RemoteRuntime.updateState(HostPhase.IDLE)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pendingLanEnabled = savedInstanceState?.getBoolean("pendingLan") ?: false
+        lanEnabled = savedInstanceState?.getBoolean("lan") ?: false
         requestNotificationPermissionIfNeeded()
         setContent {
             MaterialTheme {
                 RemoteAppScreen(
                     accessibilityEnabled = accessibilityEnabled,
                     serverRunning = serverRunning,
+                    hostBusy = hostBusy,
+                    hostMessage = hostMessage,
+                    addresses = addresses,
                     lanEnabled = lanEnabled,
                     pairingCode = pairingCode,
                     passwordConfigured = passwordConfigured,
@@ -143,29 +158,46 @@ class MainActivity : ComponentActivity() {
                     onOpenAccessibility = { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) },
                     onLanChanged = { lanEnabled = it },
                     onStart = {
-                        if (isAccessibilityEnabled()) {
+                        if (isAccessibilityEnabled() && !hostBusy && !serverRunning) {
                             pairingCode = RemoteRuntime.createPairingCode(this)
-                            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-                                pendingLanEnabled = lanEnabled
-                                val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                                projectionLauncher.launch(manager.createScreenCaptureIntent())
-                            } else {
-                                RemoteRuntime.start(this, lanEnabled)
-                                serverRunning = true
+                            pendingLanEnabled = lanEnabled
+                            RemoteRuntime.awaitingConsent()
+                            try {
+                                projectionLauncher.launch(PlatformCapabilities.captureIntent(this))
+                            } catch (_: Exception) {
+                                RemoteRuntime.updateState(HostPhase.ERROR, "无法打开录屏授权，请检查系统设置。")
                             }
                         }
                     },
                     onStop = {
                         RemoteRuntime.stop(this)
-                        serverRunning = false
                         pairingCode = null
                     }
                 )
             }
+            LaunchedEffect(serverRunning, lanEnabled) {
+                while (isActive && serverRunning) {
+                    addresses = if (lanEnabled) withContext(Dispatchers.IO) {
+                        runCatching {
+                            NetworkInterface.getNetworkInterfaces().toList().flatMap { it.inetAddresses.toList() }
+                                .filterIsInstance<Inet4Address>().filter { !it.isLoopbackAddress && !it.isLinkLocalAddress }
+                                .map { "http://${it.hostAddress}:8765" }.distinct().joinToString("\n")
+                        }.getOrDefault("").ifBlank { "未找到局域网地址，请检查 Wi-Fi 或热点。" }
+                    } else "http://127.0.0.1:8765（仅本机）"
+                    delay(5_000)
+                }
+            }
             LaunchedEffect(Unit) {
-                RemoteRuntime.running.collect { refreshState() }
+                combine(RemoteRuntime.state, RemoteAccessibilityService.connection) { _, _ -> Unit }
+                    .collect { refreshState() }
             }
         }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("pendingLan", pendingLanEnabled)
+        outState.putBoolean("lan", lanEnabled)
+        super.onSaveInstanceState(outState)
     }
 
     override fun onResume() {
@@ -175,7 +207,15 @@ class MainActivity : ComponentActivity() {
 
     private fun refreshState() {
         accessibilityEnabled = isAccessibilityEnabled()
-        serverRunning = RemoteRuntime.server != null
+        val state = RemoteRuntime.state.value
+        serverRunning = state.phase == HostPhase.RUNNING
+        hostBusy = state.busy
+        hostMessage = state.message ?: when (state.phase) {
+            HostPhase.AWAITING_CONSENT -> "请在系统弹窗中允许整屏共享。"
+            HostPhase.STARTING -> "正在等待屏幕首帧…"
+            HostPhase.STOPPING -> "正在停止服务…"
+            else -> null
+        }
         if (serverRunning) lanEnabled = RemoteRuntime.lanEnabled
         passwordConfigured = RemoteRuntime.isPasswordConfigured(this)
         pairingCode = RemoteRuntime.pairingManager.currentPairingCode()
@@ -184,10 +224,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun isAccessibilityEnabled(): Boolean {
-        val enabled = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
-            ?: return false
-        val expected = "$packageName/${RemoteAccessibilityService::class.java.name}"
-        return enabled.split(':').any { it.equals(expected, ignoreCase = true) }
+        return RemoteAccessibilityService.connected.get()
     }
 
     private fun requestNotificationPermissionIfNeeded() {
@@ -197,10 +234,14 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @androidx.compose.runtime.Composable
 private fun RemoteAppScreen(
     accessibilityEnabled: Boolean,
     serverRunning: Boolean,
+    hostBusy: Boolean,
+    hostMessage: String?,
+    addresses: String,
     lanEnabled: Boolean,
     pairingCode: String?,
     passwordConfigured: Boolean,
@@ -271,8 +312,8 @@ private fun RemoteAppScreen(
             Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("Agent API Key", style = MaterialTheme.typography.titleSmall)
                 Text("永久有效，重开应用后仍可复制。重新生成会使旧 Key 失效。", style = MaterialTheme.typography.bodySmall)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = onGenerateApiKey, enabled = !generatingApiKey, modifier = Modifier.weight(1f)) {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Button(onClick = onGenerateApiKey, enabled = !generatingApiKey) {
                         Text(if (generatingApiKey) "生成中…" else if (apiKeyConfigured) "重新生成" else "生成 API Key")
                     }
                     if (apiKey != null) OutlinedButton(onClick = onCopyApiKey, enabled = !generatingApiKey) { Text("复制") }
@@ -284,28 +325,32 @@ private fun RemoteAppScreen(
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("权限状态", style = MaterialTheme.typography.titleSmall)
-                Text(if (accessibilityEnabled) "无障碍服务已启用" else "需要启用无障碍服务", style = MaterialTheme.typography.bodySmall)
+                Text(if (accessibilityEnabled) "无障碍服务已连接" else "需要启用或重新连接无障碍服务", style = MaterialTheme.typography.bodySmall)
+                Text("每次启动需要允许整屏录制；锁屏或关闭无障碍会停止控制。侧载应用若无法开启无障碍，请到应用详情允许受限设置。后台被中断时，请检查系统的电池和后台运行设置。", style = MaterialTheme.typography.bodySmall)
                 if (!accessibilityEnabled) {
                     Button(onClick = onOpenAccessibility) { Text("打开系统设置") }
                 }
             }
         }
 
+        hostMessage?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Column(modifier = Modifier.weight(1f)) {
                 Text("允许局域网访问", style = MaterialTheme.typography.titleSmall)
                 Text("当前版本使用 HTTP，请仅在可信网络开启。", style = MaterialTheme.typography.bodySmall)
             }
-            Switch(checked = lanEnabled, onCheckedChange = onLanChanged, enabled = !serverRunning)
+            Switch(checked = lanEnabled, onCheckedChange = onLanChanged, enabled = !serverRunning && !hostBusy)
         }
 
         Spacer(Modifier.height(8.dp))
         if (!serverRunning) {
-            Button(onClick = onStart, enabled = accessibilityEnabled, modifier = Modifier.fillMaxWidth()) {
-                Text("启动远程服务")
+            Button(onClick = onStart, enabled = accessibilityEnabled && !hostBusy, modifier = Modifier.fillMaxWidth()) {
+                Text(if (hostBusy) "正在准备服务…" else "启动远程服务")
             }
         } else {
             Text("服务正在运行：端口 8765", style = MaterialTheme.typography.bodySmall)
+            Text(addresses, style = MaterialTheme.typography.bodySmall)
             pairingCode?.let {
                 Text("一次性配对码", style = MaterialTheme.typography.titleSmall)
                 Text(it, style = MaterialTheme.typography.headlineSmall)

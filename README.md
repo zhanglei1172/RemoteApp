@@ -6,7 +6,7 @@ RemoteApp 是一个需要用户明确授权的安卓被控端：通过无障碍�
 
 真机验证范围、结果及已知边界见 [测试记录](docs/testing.md)。
 
-其他 Android 版本的改造设计见 [兼容性增强方案](docs/android-compatibility.md)（待实现）。
+其他 Android 版本的改造设计见 [兼容性增强方案](docs/android-compatibility.md)。
 
 ## 构建
 
@@ -21,10 +21,12 @@ APK 输出在 `app/build/outputs/apk/debug/app-debug.apk`。网页源码在 `web
 ## 使用
 
 1. 安装 APK，打开应用并进入系统无障碍设置，启用“RemoteApp 控制服务”。
-2. 返回应用，设置访问密码；页面可上下滚动。按需打开“允许局域网访问”，点击“启动远程服务”。
+2. 返回应用，设置访问密码；页面可上下滚动。按需打开“允许局域网访问”，点击“启动远程服务”，在系统弹窗中允许整屏录制。
 3. 在同一设备上访问 `http://127.0.0.1:8765`，或在同一局域网通过手机 IP 访问端口 8765。
 4. 输入访问密码登录，或展开“一次性配对码”并输入手机上显示的配对码，即可查看画面和发送操作。
 5. 使用手机常驻通知或应用中的“停止远程服务”关闭控制端口。
+
+所有 Android 版本均需在每个新捕获会话确认录屏授权。熄屏、锁屏、无障碍断开或系统停止共享后服务会停止，解锁并重新启动即可；密码和 Key 保留。
 
 ## Agent API
 
@@ -45,3 +47,13 @@ curl -X POST -H "X-API-Key: $REMOTEAPP_API_KEY" -H 'Content-Type: application/js
 画面流仍使用 JPEG。Agent 在 `/api/v1/stream` 的 WebSocket 握手中携带相同认证头；浏览器先通过 `POST /api/v1/stream-ticket` 获取 30 秒一次性票据，再连接 `/api/v1/stream?ticket=...`。
 
 当前版本使用 HTTP，密码、Key、token 和屏幕内容会以明文经过局域网；只应在可信网络使用，公网访问请先使用 VPN。
+
+## Agent Skill
+
+仓库提供可安装的 [remoteapp-control skill](skills/remoteapp-control/SKILL.md)，包含全部现有 API 的客户端和操作规范。已配置 `REMOTEAPP_API_KEY` 后，可向 Agent 提供 IP、端口和任务，例如：
+
+```text
+$remoteapp-control 连接 192.168.1.20:8765，查看当前画面并返回桌面。
+```
+
+Skill 支持密码/配对会话、截图和画面流、点按/长按/滑动、系统动作、票据和会话撤销；截图自动保存对应版本，避免旋转后复用旧坐标。仅 IP 和端口不能替代认证。

@@ -1,240 +1,80 @@
-# RemoteApp 安卓被控端设计
+# RemoteApp 安卓被控端架构
 
-跨 Android 版本的后续改造以 [Android 兼容性增强方案](android-compatibility.md) 为准：建议统一使用 MediaProjection 截图、无障碍负责输入。该方案尚未实现；本文下述无障碍截图优先等内容属于早期设计，不代表已完成跨版本验证。
+## 产品与授权边界
 
-## 1. 产品边界
+RemoteApp 面向 Android 8（API 26）及以上：手机用户启用无障碍服务、确认系统整屏录制授权并启动服务后，Agent 或浏览器通过 HTTP/WebSocket 查看 JPEG 画面、执行手势和系统动作。默认仅监听 `127.0.0.1:8765`；用户打开 LAN 后监听 `0.0.0.0:8765`。HTTP 仅适用于可信网络或 VPN。
 
-RemoteApp 安装在一台安卓手机上。手机用户主动开启无障碍服务并启动远程控制后，局域网内的 Agent 或浏览器可以：
+密码和 API Key 长期保留，但捕获授权按会话申请。锁屏、熄屏、无障碍断开、系统停止共享或进程被杀后，不静默恢复控制，也不重放旧授权。受保护的窗口可能黑屏；不提供解锁、任意 shell、文件系统、多指事件或剪贴板控制接口。
 
-- 获取手机当前屏幕截图，或订阅低延迟画面流；
-- 发送点按、长按、滑动和系统返回/Home/最近任务等操作；
-- 通过手机上显示的配对码建立授权会话；
-- 在网页中完成同样的查看和操作。
+兼容性决策及验收清单见 [android-compatibility.md](android-compatibility.md)，已执行结果见 [testing.md](testing.md)。
 
-远程控制必须由手机用户显式开启。应用不会尝试静默启用无障碍服务、绕过系统授权、隐藏前台服务通知或获得 root 权限。第一版只面向可信局域网，公网访问应通过 VPN 或用户自己的反向代理实现。
-
-## 2. 推荐技术栈
-
-- Kotlin、Android Gradle Plugin、Jetpack Compose；
-- `minSdk 26`，`target/compileSdk` 使用当前稳定版本；
-- AndroidX Lifecycle、DataStore、Security Crypto；
-- Ktor Server CIO（HTTP、WebSocket、静态资源）或一个等价的嵌入式 HTTP/WebSocket 服务；
-- kotlinx.serialization；
-- `AccessibilityService` 负责手势和系统动作；
-- Android 11（API 30）及以上优先使用 `AccessibilityService.takeScreenshot`；较低版本或设备兼容性不满足时，使用 `MediaProjection`，由用户在系统弹窗中再次授权。
-
-服务进程不应依赖 Activity 存活。Activity 只负责设置、配对和启停；真正的远程控制由前台服务托管。
-
-## 3. 组件和数据流
+## 组件与数据流
 
 ```mermaid
 flowchart LR
-    B[浏览器或 Agent] -->|HTTPS + REST/WebSocket| H[HttpServerService]
-    H --> S[Session/Auth Manager]
-    H --> C[CaptureManager]
-    H --> I[InputController]
-    C --> A[RemoteAccessibilityService]
-    C --> M[MediaProjection fallback]
-    I --> A
-    A --> OS[Android 系统窗口与输入]
-    APP[MainActivity / Compose UI] --> H
-    APP --> A
+    UI[MainActivity] -->|用户确认整屏录制| F[RemoteControlForegroundService]
+    F --> C[CaptureManager / MediaProjection]
+    C --> J[共享最新 JPEG 和不可变几何快照]
+    H[HttpServer] --> J
+    A[Agent / 网页] -->|密码会话或 API Key| H
+    H --> I[RemoteAccessibilityService]
+    I -->|完成或取消回调| H
+    F --> H
+    UI <-->|StateFlow| R[RemoteRuntime]
 ```
 
-建议的包结构：
+- `platform/PlatformCapabilities` 集中处理 SDK 差异、整屏授权 Intent 和默认显示器尺寸。
+- `RemoteRuntime` 保存运行状态和服务引用；`HostState` 包含 Idle、AwaitingConsent、Starting、Running、Stopping、Error。
+- `CaptureManager` 是所有 Android 版本共用的单一截图生产者。
+- `RemoteAccessibilityService` 只负责输入和连接状态；不再使用 API 30+ 的无障碍截图路径。
+- `HttpServer` 提供认证、截图、画面流、归一化输入及能力状态。具体接口见 [Agent 调用指南](agent-api.md)。
 
-```text
-com.example.remoteapp
-  ui/                  # Compose 设置、配对、服务状态
-  accessibility/      # RemoteAccessibilityService、节点和手势适配
-  capture/             # Accessibility 截图、MediaProjection、帧率控制
-  server/              # HTTP 路由、WebSocket、静态网页
-  auth/                # 配对、token、撤销、审计
-  domain/              # DTO、错误码、设备状态
-  platform/            # Android 版本和厂商差异封装
-```
+## 启动和停止
 
-截图帧不要在主线程处理。`CaptureManager` 只保留最新帧，采用有界队列（建议长度为 1），编码线程根据订阅者数量决定 JPEG 质量和帧率，避免远程端变慢导致手机内存增长。
+1. 可见 Activity 检查无障碍实际连接状态，发起系统捕获授权。API 34+ 使用 `MediaProjectionConfig.createConfigForDefaultDisplay()` 请求整屏。
+2. 授权成功后启动前台服务；API 29+ 显式使用 `mediaProjection` 类型，Manifest 声明对应普通权限及 API 34+ 类型权限。
+3. 服务进入前台后获取 MediaProjection，先注册生命周期回调，再创建唯一 VirtualDisplay。重复启动不重复消费授权或创建显示器。
+4. 有效首帧就绪后才开启 HTTP 监听并发布 Running；首帧超时、无障碍未连接、手机锁定或启动异常时停止服务并显示原因。
+5. 用户停止、熄屏、无障碍断开或投影 `onStop()` 时，先禁止读取旧画面和提交新输入，再停止监听并释放投影、ImageReader、Bitmap、线程及回调。
 
-## 4. Android 权限与生命周期
+前台服务使用 `START_NOT_STICKY`，不通过开机广播恢复录屏。Activity 重建不重启运行中的捕获；仅保存待授权的 LAN 选择等非敏感界面状态。运行状态通过 StateFlow 更新，错误不会被“服务已启动”的乐观显示覆盖。
 
-Manifest 需要按实际实现声明：
+已经提交给系统的手势没有通用的撤回 API；停止后禁止新手势，Agent 不应假设先前提交的手势被自动回滚。
 
-```xml
-<uses-permission android:name="android.permission.INTERNET" />
-<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-<!-- 使用 MediaProjection fallback 时（API 34+） -->
-<uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
-<!-- Android 13+ 用于显示服务通知 -->
-<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+## 捕获、性能和屏幕几何
 
-<service
-    android:name=".accessibility.RemoteAccessibilityService"
-    android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
-    android:exported="true">
-    <intent-filter>
-        <action android:name="android.accessibilityservice.AccessibilityService" />
-    </intent-filter>
-    <meta-data
-        android:name="android.accessibilityservice"
-        android:resource="@xml/remote_accessibility_service" />
-</service>
-```
+MediaProjection 使用默认内置显示器，VirtualDisplay + RGBA ImageReader + JPEG。捕获缓冲区长边最多 1920 像素，维持整屏比例；这属于内部资源限制，不增加用户分辨率设置。源屏尺寸与 JPEG 尺寸分别记录，不能混用。
 
-无障碍配置应声明读取窗口内容、执行手势等能力，并在支持的 API level 上声明截图能力。配置文件中的 `canTakeScreenshot`、`canPerformGestures` 等属性需以当前 compileSdk 的 schema 为准，低版本使用 `res/values-vXX` 或运行时能力检查，避免在旧系统解析失败。
+一个 HandlerThread 串行处理显示变化和编码，最多每 200ms 编码一次（约 5 FPS）。ImageReader 缓冲上限为 2，Bitmap 和紧凑像素缓冲按几何复用，所有 HTTP/画面流客户端共享最新 JPEG。逐行复制跳过 rowStride padding，包括没有末行 padding 的缓冲区。静止画面可复用最后有效帧；捕获已终止时立即失效，不以旧 JPEG 冒充可用捕获。
 
-推荐生命周期：
+几何快照包含源屏宽高、JPEG 宽高、旋转和 revision。API 30+ 查询默认显示器最大 WindowMetrics，旧版本查询 real metrics。API 34+ 同时处理捕获尺寸回调；普通显示变化使用 DisplayListener。旋转或分辨率改变时清空旧帧、替换 Surface 并复用 VirtualDisplay，避免 Android 14+ 重复创建的授权异常。检测到捕获范围与整屏不符时停止控制，不猜测单应用窗口偏移。
 
-1. 首次打开显示用途、风险和隐私说明；用户跳转系统设置手动启用无障碍服务。
-2. 用户点击“启动远程服务”。应用启动前台服务，显示常驻通知和停止按钮。
-3. API 30+ 先尝试无障碍截图；失败时在 Activity 中发起 MediaProjection 授权，并把结果交给前台服务。
-4. 用户关闭开关、撤销配对、无障碍服务断开或系统回收进程时，立即停止 HTTP 服务并清理投影资源。
+坐标为 `[0,1]` 的归一化整屏坐标，乘以源屏尺寸并夹到最后有效像素；不减状态栏或导航栏高度。revision 在映射变化时递增，每次捕获会话使用新的随机安全整数起点，防止进程重启后旧版本再次碰巧有效。手势提交前在主线程再次检查 revision。
 
-无障碍服务断开时，所有输入接口应返回 `503 ACCESSIBILITY_UNAVAILABLE`，而不是排队等待。
+## 输入与 Agent 行为
 
-## 5. 屏幕捕获和坐标模型
+点按、长按和滑动在无障碍主线程执行，等待 `GestureResultCallback`；完成返回 `accepted:true, completed:true`。一个设备同一时刻只接受一个屏幕手势，忙时返回 `409 INPUT_BUSY`，取消返回 `409 GESTURE_CANCELLED`。请求断开不会提前释放手势门闩。若系统超时未确认完成，停止控制，要求用户重新启动，防止未知状态下继续输入。
 
-### 捕获优先级
+系统动作仍返回 `accepted:true`，仅表示 Android 接受动作，不保证目标界面已绘制完成。Agent 在每次操作后应重新截图确认。旧 revision 返回 `409 SCREEN_CHANGED`，必须重新观察目标，不能自动重放原坐标。
 
-- API 30+：调用 `AccessibilityService.takeScreenshot(displayId, ...)`，将 `HardwareBuffer` 转成 `Bitmap`，再编码为 JPEG/PNG。
-- 兼容路径：使用 `MediaProjection` + `VirtualDisplay` + `ImageReader`。必须显示 Android 的用户同意对话框，并按系统版本设置媒体投影前台服务类型。
-- `FLAG_SECURE`、DRM 视频、系统权限弹窗等内容可能返回黑屏或不可捕获，这是 Android 的平台限制，接口要允许客户端识别 `CAPTURE_RESTRICTED`。
+`/device` 暴露实际捕获状态、是否可控制、源屏/JPEG 尺寸、默认显示器 ID 和帧序号。截图头包含同一帧的版本、几何和帧年龄；帧年龄是诊断数据，静止画面年龄较大不等于会话失效。
 
-所有操作使用“物理像素坐标”或“归一化坐标”二选一，不能让客户端猜测缩放比例：
+## 网页与画面流
 
-```json
-{
-  "x": 0.42,
-  "y": 0.73,
-  "space": "normalized",
-  "screenRevision": 1842
-}
-```
+WebSocket 升级前校验认证，最多同时 4 路画面流；慢连接发送有超时。默认发送上限为 5 FPS，客户端可请求 1–15 FPS，但底层编码仍最多约 5 FPS，不保证更高的有效更新率。
 
-`GET /screen` 通过 `X-Screen-Revision`、`X-Screen-Width`、`X-Screen-Height`、`X-Screen-Rotation` 响应头携带截图对应的几何信息。revision 仅在尺寸或旋转变化时更新，正常画面刷新不会使输入失效。
+首条 `hello` 描述几何，几何变化后再次发送 hello。每个 JPEG 前发送 `type:frame` 元数据，包含该二进制 JPEG 的 revision、尺寸、源屏尺寸和 sequence。网页只保留最新待解码帧，绘制完成后才更新可点击版本；异步旧帧、旧连接和过期 HTTP 响应不能覆盖新会话。断线、页面隐藏和离线期间禁止画布输入，恢复后重新获取画面和流票据。
 
-归一化坐标范围为 `[0, 1]`，以当前截图的可用显示区域为准。服务返回 `width`、`height`、旋转角度、状态栏/导航栏偏移和 `screenRevision`；客户端在发送旧 revision 时得到 `409 SCREEN_CHANGED`，避免旋转或窗口变化后误触。
+App 设置页可滚动、避让安全区和键盘，Key 按钮允许换行；运行时显示本机或 LAN 地址。网页维持画布比例和至少 44px 操作目标，兼顾手机横竖屏和桌面窗口。
 
-## 6. HTTP 和 WebSocket API（v1）
+## 认证与持久化
 
-所有接口以 `/api/v1` 开头，成功响应为 JSON，错误统一为：
+手机设置的 6–128 位密码通过随机盐 + PBKDF2-HMAC-SHA256（100,000 次）验证，在后台线程计算；失败登录有 1–32 秒递增退避。旧密码格式在成功登录时升级。一次性配对码继续支持，5 分钟有效。
 
-```json
-{
-  "error": "ACCESSIBILITY_UNAVAILABLE",
-  "message": "Accessibility service is not connected",
-  "requestId": "..."
-}
-```
+手机生成 256 位随机永久 API Key，支持 `X-API-Key`、`Authorization: ApiKey` 和 Bearer；随机会话使用 Bearer。Key 原值和验证摘要保存在 Android Keystore 保护的 EncryptedSharedPreferences，允许重启后再次复制。更新密码撤销会话；撤销会话、停止服务和重新录屏不轮换 Key。手机重新生成 Key 会使旧 Key 及相关流凭据失效。卸载或清除数据会删除凭据。
 
-### 设备和状态
+浏览器先通过认证接口获取 30 秒单次流票据，避免将永久 Key 或会话 token 放入 URL。流持续检查原凭据；撤销后关闭连接。API 响应禁止缓存。日志和仓库不保存密码、Key、token 或屏幕内容。
 
-| 方法 | 路径 | 用途 |
-| --- | --- | --- |
-| `GET` | `/api/v1/device` | 设备名、应用版本、Android 版本、屏幕尺寸、旋转角度、服务状态 |
-| `GET` | `/api/v1/screen` | 返回当前一张 JPEG/PNG |
-| `GET` | `/api/v1/health` | 本地健康检查，不暴露敏感信息 |
+## 已知边界
 
-### 输入
-
-`POST /api/v1/input/tap`
-
-```json
-{"x":0.42,"y":0.73,"space":"normalized","screenRevision":1842}
-```
-
-`POST /api/v1/input/swipe`
-
-```json
-{
-  "from":{"x":0.5,"y":0.8},
-  "to":{"x":0.5,"y":0.2},
-  "durationMs":450,
-  "space":"normalized",
-  "screenRevision":1842
-}
-```
-
-`POST /api/v1/input/long-press` 与 `POST /api/v1/system-action`（`BACK`、`HOME`、`RECENTS`、`NOTIFICATIONS`）可以复用同一套鉴权和 revision 检查。第一版不开放任意 shell、文件系统、短信、通讯录或后台启动 Activity。
-
-### 画面流
-
-`GET /api/v1/stream` 使用 WebSocket。服务端发送：
-
-1. 一条 JSON 元数据：`{type:"hello", width, height, rotation, revision, format:"jpeg"}`；
-2. 后续每条二进制消息为一张 JPEG；
-3. 客户端发送 `{type:"setQuality", fps:10}` 调整发送频率（1-15 FPS），JPEG 质量固定为 65。
-
-握手升级前校验会话或 API Key。浏览器通过认证的 `POST /api/v1/stream-ticket` 换取有效期 30 秒、单次使用的票据，再以 `ticket` 查询参数连接；票据绑定原凭据。会话撤销、密码修改或 API Key 轮换后，相关旧连接会关闭。
-
-默认上限建议为 10 FPS、720p、JPEG 质量 65。服务端对每个连接限速和限帧，断开时释放订阅。
-
-## 7. 配对、认证与网络暴露
-
-### 密码、配对和 API Key（当前实现）
-
-1. 默认只监听 `127.0.0.1`，用户在应用中打开“允许局域网访问”后才监听局域网地址。
-2. 手机用户可设置 6-128 位密码，网页通过 `POST /api/v1/auth/login`（`{"password":"..."}`）取得随机 Bearer 会话。密码使用随机盐和 PBKDF2-HMAC-SHA256（100,000 次）保存于加密偏好设置，在后台线程计算以兼顾旧设备响应；失败登录递增退避 1-32 秒。
-3. 启动服务时仍提供 5 分钟有效的六位一次性配对码，兼容 `/api/v1/pairing/claim`。会话 token 只保存 SHA-256 摘要；更新密码撤销已有会话。
-4. 手机可生成、复制 256 位随机 API Key。摘要用于验证，原值存于 Android Keystore 保护的 EncryptedSharedPreferences，以便重启后再次复制。Key 不设有效期，重新生成后旧 Key 失效；清数据/卸载同样删除 Key。更改密码、撤销会话及停止服务不删除 Key。
-5. `/session/revoke` 撤销当前 Bearer 会话；`/session/revoke-all` 撤销全部会话，两者不轮换 API Key。API Key 只在手机 UI 生成或替换，不通过远程接口读取。
-
-### 传输和访问控制
-
-- 当前实现默认使用 HTTP；手机 UI 必须显式打开局域网访问，并明确提示屏幕和 token 会以明文经过局域网。公网场景不得直接暴露端口。
-- 后续切换 HTTPS 时使用安装级证书和配对指纹；在 HTTPS 完成前，VPN 是推荐的跨网络接入方式。
-- 除健康检查、登录/配对接口和静态网页外，API 都需要认证。Agent 可使用 `X-API-Key: <key>`、`Authorization: ApiKey <key>` 或 `Authorization: Bearer <key>`；网页使用 Bearer 会话。API 响应禁止缓存。更多来源、请求体大小、并发及输入频率限制仍属于后续硬化工作。
-- 可选的 mDNS 服务名为 `_remoteapp._tcp`，只用于发现，不能代替认证。
-- 页面和 API 同源提供，避免 CORS 成为默认配置；若 Agent 跨域调用，提供明确的 CORS allowlist。
-
-## 8. 网页控制台
-
-静态网页由同一个 HTTP 服务提供，避免额外部署：
-
-- 左侧显示设备状态、连接质量、截图尺寸和“停止远程服务”；
-- 中间显示 `<canvas>` 或 `<img>` 画面，按实际帧尺寸计算归一化坐标；
-- 鼠标按下/移动/抬起映射为 tap、swipe、long-press；触摸屏使用 Pointer Events；
-- 右侧提供 Back、Home、Recents、刷新截图、画质/FPS 调整；
-- 每个危险动作显示当前设备名和连接地址，防止在多个标签页中误控设备。
-
-网页不应在服务器端执行脚本或加载第三方 CDN，减少控制页面被篡改和泄露 token 的机会。token 放在内存或 sessionStorage，提供“撤销当前浏览器”按钮。
-
-## 9. 安全和隐私威胁模型
-
-远程控制等同于把屏幕和输入权限交给网络客户端，必须把“已配对客户端”当成高权限主体：
-
-- 开机或应用重启后默认不自动开放局域网端口，除非用户明确打开持久开关；
-- 前台通知显示“正在被远程控制”、客户端 IP 和停止入口；
-- 记录配对、连接、输入类型、失败原因和撤销事件，日志中不保存屏幕图片和 token；
-- 提供“一键停止服务”“撤销全部 token”“仅本机访问”三个明显操作；
-- 认证失败、异常高频手势、连接数超限时临时封禁来源；
-- 不把屏幕帧写入磁盘，避免敏感信息残留；
-- 在产品文档中明确：用户需要对被控设备和网络拥有授权，不能用于绕过应用安全控制或未经同意监控他人。
-
-## 10. 第一版里程碑
-
-### M0：本地闭环
-
-完成无障碍服务启用引导、单张截图、tap/swipe、前台服务和本机 `127.0.0.1` API。用 Android instrumentation 或手工设备验证旋转、分屏和锁屏行为。
-
-### M1：局域网控制
-
-加入 HTTPS、一次性配对码、token 撤销、`/screen` 和 WebSocket 流，完成手机浏览器以外的一台桌面浏览器控制。
-
-### M2：网页控制台和兼容性
-
-完成静态控制页面、mDNS、MediaProjection fallback、Android 版本矩阵和常见厂商电池优化提示。
-
-### M3：硬化
-
-增加速率限制、审计日志、连接管理、设备旋转/revision 校验、自动化回归测试和可选 VPN/反向代理部署文档。
-
-## 11. 验收标准
-
-- 未启用无障碍服务时，任何输入接口都不能产生系统操作；
-- 未配对的客户端只能访问健康检查，不能获得截图或发送输入；
-- 手机屏幕旋转后，旧 revision 的坐标请求被拒绝；
-- 断开浏览器 WebSocket 后，服务端不会继续生成无订阅帧；
-- 点击应用通知中的停止按钮后，端口关闭、投影释放、token 保持可撤销；
-- Android 11、13、14 至少各验证一次，覆盖普通窗口、`FLAG_SECURE` 窗口、锁屏和电池优化场景。
-
+厂商可能回收进程或禁用无障碍，设置页提供排查说明，但不承诺后台永久在线。没有完成验收的折叠屏、外接屏、多显示器和厂商浏览器不声明支持。模拟器验证系统 API，不能替代厂商设备上的电池策略、性能、锁屏和输入行为测试。

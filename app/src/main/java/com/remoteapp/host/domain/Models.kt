@@ -28,7 +28,14 @@ data class DeviceStatus(
     val height: Int,
     val rotation: Int,
     val screenRevision: Long,
-    val captureMode: String
+    val captureMode: String,
+    val captureState: String = "unavailable",
+    val controlReady: Boolean = false,
+    val sourceWidth: Int = 0,
+    val sourceHeight: Int = 0,
+    val displayId: Int = 0,
+    val frameSequence: Long = 0,
+    val lastError: String? = null,
 )
 
 @Serializable
@@ -73,7 +80,10 @@ data class StreamHello(
     val height: Int,
     val rotation: Int,
     val revision: Long,
-    val format: String = "jpeg"
+    val format: String = "jpeg",
+    val sequence: Long = 0,
+    val sourceWidth: Int = width,
+    val sourceHeight: Int = height,
 )
 
 @Serializable

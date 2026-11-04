@@ -4,6 +4,52 @@ const tokenKey = "remoteapp-token";
 const app = document.querySelector<HTMLDivElement>("#app")!;
 let screenSocket: WebSocket | undefined;
 let screenRevision: number | undefined;
+let viewGeneration = 0;
+type FrameInfo = { revision: number; width: number; height: number };
+let incomingRevision: number | undefined;
+let pendingFrame: { blob: Blob; info: FrameInfo; generation: number } | undefined;
+let decoding = false;
+let inputBusy = false;
+
+function invalidateView() {
+  ++viewGeneration;
+  screenRevision = undefined;
+  incomingRevision = undefined;
+  pendingFrame = undefined;
+  const previous = screenSocket;
+  screenSocket = undefined;
+  previous?.close();
+}
+
+async function drawFrames() {
+  if (decoding) return;
+  decoding = true;
+  try {
+    while (pendingFrame) {
+      const frame = pendingFrame;
+      pendingFrame = undefined;
+      const bitmap = await createImageBitmap(frame.blob);
+      try {
+        if (frame.generation !== viewGeneration || frame.info.revision !== incomingRevision || document.hidden) continue;
+        const canvas = document.querySelector<HTMLCanvasElement>("#screen")!;
+        canvas.width = bitmap.width; canvas.height = bitmap.height;
+        canvas.getContext("2d")!.drawImage(bitmap, 0, 0);
+        screenRevision = frame.info.revision;
+        document.querySelector("#status")!.textContent = `${bitmap.width} × ${bitmap.height}`;
+      } finally { bitmap.close(); }
+    }
+  } catch {
+    screenRevision = undefined;
+    document.querySelector("#status")!.textContent = "画面解码失败，请刷新";
+  } finally { decoding = false; }
+}
+
+async function input(path: string, body: unknown) {
+  if (inputBusy || screenRevision === undefined) return;
+  inputBusy = true;
+  try { await api(path, { method: "POST", body: JSON.stringify(body) }); }
+  finally { inputBusy = false; }
+}
 
 type NormalizedPoint = { x: number; y: number };
 
@@ -29,18 +75,23 @@ async function api(path: string, init: RequestInit = {}) {
   try {
     response = await fetch(path, { ...init, headers });
   } catch {
+    invalidateView();
     document.querySelector("#status")!.textContent = "连接中断，请检查手机服务";
     return new Response(null, { status: 503 });
   }
   if (response.status === 401 && path !== "/api/v1/pairing/claim") showLogin();
-  if (response.status === 409) document.querySelector("#meta")!.textContent = "屏幕方向已变化，请重新操作。";
+  if (response.status === 409) {
+    const error = await response.clone().json().catch(() => ({})) as { error?: string };
+    document.querySelector("#meta")!.textContent = error.error === "INPUT_BUSY" ? "请等待上一操作完成。" : "操作未完成，请检查画面后重新操作。";
+    if (error.error === "SCREEN_CHANGED") screenRevision = undefined;
+  }
   if (response.status === 503) document.querySelector("#meta")!.textContent = "请检查手机的无障碍和屏幕捕获权限。";
   return response;
 }
 
 function showLogin() {
   sessionStorage.removeItem(tokenKey);
-  screenSocket?.close();
+  invalidateView();
   document.querySelector("#pairing")?.classList.remove("hidden");
   document.querySelector("#console")?.classList.add("hidden");
   document.querySelector("#status")!.textContent = "请登录";
@@ -86,7 +137,7 @@ function render() {
   document.querySelector<HTMLButtonElement>("#refresh")!.onclick = refresh;
   document.querySelector<HTMLButtonElement>("#revoke")!.onclick = revoke;
   document.querySelectorAll<HTMLButtonElement>("[data-action]").forEach((button) => {
-    button.onclick = () => api("/api/v1/system-action", { method: "POST", body: JSON.stringify({ action: button.dataset.action }) });
+    button.onclick = () => input("/api/v1/system-action", { action: button.dataset.action });
   });
   if (sessionStorage.getItem(tokenKey)) showConsole();
 }
@@ -148,56 +199,56 @@ function showConsole() {
   document.querySelector("#pairing")?.classList.add("hidden");
   document.querySelector("#console")?.classList.remove("hidden");
   void refresh().catch(() => { document.querySelector("#status")!.textContent = "连接中断"; });
-  void stream().catch(() => { document.querySelector("#status")!.textContent = "画面流中断，可点击刷新"; });
+
 }
 
 async function refresh() {
+  invalidateView();
+  if (!sessionStorage.getItem(tokenKey) || document.hidden) return;
+  const generation = viewGeneration;
   const response = await api("/api/v1/screen");
-  if (!response.ok) return;
+  if (!response.ok || generation !== viewGeneration) return;
+  const revision = Number(response.headers.get("X-Screen-Revision"));
   const blob = await response.blob();
-  const revision = response.headers.get("X-Screen-Revision");
-  if (revision !== null) screenRevision = Number(revision);
-  const bitmap = await createImageBitmap(blob);
-  const canvas = document.querySelector<HTMLCanvasElement>("#screen")!;
-  const { width, height } = bitmap;
-  canvas.width = width; canvas.height = height;
-  canvas.getContext("2d")!.drawImage(bitmap, 0, 0);
-  bitmap.close();
-  document.querySelector("#status")!.textContent = `${width} × ${height}`;
+  if (generation !== viewGeneration || !Number.isSafeInteger(revision)) return;
+  incomingRevision = revision;
+  pendingFrame = { blob, info: { revision, width: 0, height: 0 }, generation };
+  await drawFrames();
+  if (generation === viewGeneration) await stream(generation);
 }
 
-async function stream() {
+async function stream(generation: number) {
   const response = await api("/api/v1/stream-ticket", { method: "POST" });
-  if (!response.ok) return;
+  if (!response.ok || generation !== viewGeneration) return;
   const { ticket } = await response.json() as { ticket: string };
-  if (!sessionStorage.getItem(tokenKey)) return;
+  if (!sessionStorage.getItem(tokenKey) || generation !== viewGeneration) return;
   const protocol = location.protocol === "https:" ? "wss" : "ws";
-  screenSocket?.close();
   const socket = new WebSocket(`${protocol}://${location.host}/api/v1/stream?ticket=${encodeURIComponent(ticket)}`);
   screenSocket = socket;
+  let info: FrameInfo | undefined;
   socket.onclose = (event) => {
     if (screenSocket !== socket) return;
+    invalidateView();
     if (event.code === 1008) showLogin();
-    else if (sessionStorage.getItem(tokenKey)) document.querySelector("#status")!.textContent = "画面流中断，可点击刷新";
+    else if (sessionStorage.getItem(tokenKey)) document.querySelector("#status")!.textContent = "画面流中断，请点击刷新";
   };
   socket.binaryType = "blob";
-  socket.onmessage = async (event) => {
+  socket.onmessage = (event) => {
+    if (generation !== viewGeneration || screenSocket !== socket) return;
     if (typeof event.data === "string") {
-      const info = JSON.parse(event.data) as { revision: number; width: number; height: number };
-      screenRevision = info.revision;
-      document.querySelector("#status")!.textContent = `${info.width} × ${info.height}`;
+      info = JSON.parse(event.data) as FrameInfo;
+      if (incomingRevision !== info.revision) screenRevision = undefined;
+      incomingRevision = info.revision;
       return;
     }
-    const bitmap = await createImageBitmap(event.data);
-    const canvas = document.querySelector<HTMLCanvasElement>("#screen")!;
-    canvas.width = bitmap.width; canvas.height = bitmap.height;
-    canvas.getContext("2d")!.drawImage(bitmap, 0, 0);
-    bitmap.close();
+    if (!info) return;
+    pendingFrame = { blob: event.data as Blob, info, generation };
+    void drawFrames();
   };
   const canvas = document.querySelector<HTMLCanvasElement>("#screen")!;
   let start: { point: NormalizedPoint; pointerId: number; time: number; revision?: number } | undefined;
   canvas.onpointerdown = (event) => {
-    if (event.pointerType === "mouse" && event.button !== 0) return;
+    if (screenRevision === undefined || inputBusy || (event.pointerType === "mouse" && event.button !== 0)) return;
     event.preventDefault();
     start = { point: normalizedPoint(canvas, event), pointerId: event.pointerId, time: Date.now(), revision: screenRevision };
     canvas.setPointerCapture?.(event.pointerId);
@@ -205,13 +256,14 @@ async function stream() {
   canvas.onpointerup = (event) => {
     if (!start || start.pointerId !== event.pointerId) return;
     event.preventDefault();
+    if (screenRevision === undefined || start.revision !== screenRevision) { start = undefined; return; }
     const to = normalizedPoint(canvas, event);
     const from = start.point;
     const duration = Date.now() - start.time;
     if (Math.hypot(to.x - from.x, to.y - from.y) < 0.02) {
-      void api(duration > 550 ? "/api/v1/input/long-press" : "/api/v1/input/tap", { method: "POST", body: JSON.stringify({ x: to.x, y: to.y, space: "normalized", screenRevision: start.revision }) });
+      void input(duration > 550 ? "/api/v1/input/long-press" : "/api/v1/input/tap", { x: to.x, y: to.y, space: "normalized", screenRevision: start.revision });
     } else {
-      void api("/api/v1/input/swipe", { method: "POST", body: JSON.stringify({ from, to, durationMs: Math.max(80, duration), space: "normalized", screenRevision: start.revision }) });
+      void input("/api/v1/input/swipe", { from, to, durationMs: Math.min(10000, Math.max(80, duration)), space: "normalized", screenRevision: start.revision });
     }
     start = undefined;
     canvas.releasePointerCapture?.(event.pointerId);
@@ -224,5 +276,12 @@ async function revoke() {
   await api("/api/v1/session/revoke", { method: "POST" });
   showLogin();
 }
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) invalidateView();
+  else if (sessionStorage.getItem(tokenKey)) void refresh();
+});
+window.addEventListener("offline", () => invalidateView());
+window.addEventListener("online", () => { if (sessionStorage.getItem(tokenKey)) void refresh(); });
 
 render();

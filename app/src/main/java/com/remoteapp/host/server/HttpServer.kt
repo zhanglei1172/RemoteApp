@@ -2,7 +2,7 @@ package com.remoteapp.host.server
 
 import android.content.Context
 import android.os.Build
-import android.util.DisplayMetrics
+import com.remoteapp.host.accessibility.GestureResult
 import com.remoteapp.host.accessibility.RemoteAccessibilityService
 import com.remoteapp.host.capture.CaptureManager
 import com.remoteapp.host.auth.Credential
@@ -48,6 +48,8 @@ import io.ktor.util.AttributeKey
 import io.ktor.server.websocket.WebSockets
 import io.ktor.websocket.close
 import io.ktor.websocket.readText
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -55,7 +57,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import java.util.UUID
-import kotlin.math.roundToInt
+import java.util.concurrent.atomic.AtomicInteger
+import com.remoteapp.host.platform.PlatformCapabilities
 
 class HttpServer(
     private val context: Context,
@@ -65,6 +68,7 @@ class HttpServer(
     private val codec = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     private var engine: EmbeddedServer<*, *>? = null
     private var bindLan: Boolean = false
+    private val streamSlots = Semaphore(4)
 
     fun start(allowLan: Boolean) {
         if (engine != null) return
@@ -89,7 +93,7 @@ class HttpServer(
                 call.respondError(HttpStatusCode.UnsupportedMediaType, "UNSUPPORTED_MEDIA_TYPE", "Use Content-Type: application/json")
             }
         }
-        install(WebSockets)
+        install(WebSockets) { maxFrameSize = 16 * 1024 }
         intercept(ApplicationCallPipeline.Plugins) {
             if (call.request.path().startsWith("/api/")) {
                 call.response.headers.append(HttpHeaders.CacheControl, "no-store")
@@ -125,6 +129,10 @@ class HttpServer(
                     call.response.headers.append("X-Screen-Width", frame.width.toString())
                     call.response.headers.append("X-Screen-Height", frame.height.toString())
                     call.response.headers.append("X-Screen-Rotation", frame.rotation.toString())
+                    call.response.headers.append("X-Screen-Source-Width", frame.geometry.sourceWidth.toString())
+                    call.response.headers.append("X-Screen-Source-Height", frame.geometry.sourceHeight.toString())
+                    call.response.headers.append("X-Frame-Sequence", frame.sequence.toString())
+                    call.response.headers.append("X-Frame-Age-Ms", (android.os.SystemClock.elapsedRealtime() - frame.capturedAtMs).toString())
                     call.respondBytes(frame.jpeg, ContentType.Image.JPEG)
                 }
             }
@@ -158,38 +166,36 @@ class HttpServer(
                 val request = call.receive<TapRequest>()
                 val point = call.coordinate(request.x, request.y, request.space, request.screenRevision)
                     ?: return@post
-                val accepted = RemoteAccessibilityService.instance?.tap(point.first.toFloat(), point.second.toFloat()) == true
-                if (!accepted) call.respondError(HttpStatusCode.ServiceUnavailable, "ACCESSIBILITY_UNAVAILABLE", "Accessibility service is not connected")
-                else call.respond(mapOf("accepted" to true))
+                call.respondGesture(RemoteAccessibilityService.instance?.tap(point.x.toFloat(), point.y.toFloat(), point.revision))
             }
             post("/api/v1/input/long-press") {
                 if (!call.authorized()) return@post
                 val request = call.receive<TapRequest>()
                 val point = call.coordinate(request.x, request.y, request.space, request.screenRevision)
                     ?: return@post
-                val accepted = RemoteAccessibilityService.instance?.longPress(point.first.toFloat(), point.second.toFloat()) == true
-                if (!accepted) call.respondError(HttpStatusCode.ServiceUnavailable, "ACCESSIBILITY_UNAVAILABLE", "Accessibility service is not connected")
-                else call.respond(mapOf("accepted" to true))
+                call.respondGesture(RemoteAccessibilityService.instance?.longPress(point.x.toFloat(), point.y.toFloat(), point.revision))
             }
             post("/api/v1/input/swipe") {
                 if (!call.authorized()) return@post
                 val request = call.receive<SwipeRequest>()
                 val from = call.coordinate(request.from.x, request.from.y, request.space, request.screenRevision)
                     ?: return@post
-                val to = call.coordinate(request.to.x, request.to.y, request.space, request.screenRevision)
+                val to = call.coordinate(request.to.x, request.to.y, request.space, from.revision)
                     ?: return@post
-                val accepted = RemoteAccessibilityService.instance?.swipe(
-                    from.first.toFloat(), from.second.toFloat(), to.first.toFloat(), to.second.toFloat(), request.durationMs
-                ) == true
-                if (!accepted) call.respondError(HttpStatusCode.ServiceUnavailable, "ACCESSIBILITY_UNAVAILABLE", "Accessibility service is not connected")
-                else call.respond(mapOf("accepted" to true))
+                call.respondGesture(RemoteAccessibilityService.instance?.swipe(
+                    from.x.toFloat(), from.y.toFloat(), to.x.toFloat(), to.y.toFloat(), request.durationMs, from.revision,
+                ))
             }
             post("/api/v1/system-action") {
                 if (!call.authorized()) return@post
                 val request = call.receive<SystemActionRequest>()
-                if (!RemoteAccessibilityService.globalAction(request.action)) {
-                    call.respondError(HttpStatusCode.BadRequest, "UNSUPPORTED_ACTION", "Unsupported or unavailable system action")
-                } else call.respond(mapOf("accepted" to true))
+                if (request.action.uppercase() !in setOf("BACK", "HOME", "RECENTS", "NOTIFICATIONS")) {
+                    call.respondError(HttpStatusCode.BadRequest, "UNSUPPORTED_ACTION", "Unsupported system action")
+                } else {
+                    val result = RemoteAccessibilityService.globalAction(request.action)
+                    if (result == GestureResult.COMPLETED) call.respond(mapOf("accepted" to true))
+                    else call.respondGesture(result)
+                }
             }
             post("/api/v1/session/revoke") {
                 val token = call.bearerToken()
@@ -207,49 +213,63 @@ class HttpServer(
                     close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "Authentication required"))
                     return@webSocket
                 }
-                var fps = 10
-                val first = capture.capture() ?: capture.latestFrame()
-                if (first == null) {
-                    close()
+                if (!streamSlots.tryAcquire()) {
+                    close(CloseReason(CloseReason.Codes.TRY_AGAIN_LATER, "Too many screen streams"))
                     return@webSocket
                 }
-                send(Frame.Text(codec.encodeToString(StreamHello.serializer(), StreamHello(
-                    width = first.width,
-                    height = first.height,
-                    rotation = first.rotation,
-                    revision = first.revision
-                ))))
-                val commandJob = launch {
-                    for (frame in incoming) {
-                        if (frame is Frame.Text) {
-                            runCatching { codec.decodeFromString(QualityRequest.serializer(), frame.readText()) }
-                                .getOrNull()?.let { request -> fps = request.fps?.coerceIn(1, 15) ?: fps }
-                        }
-                    }
-                }
                 try {
-                    var lastRevision = first.revision
-                    while (isActive) {
-                        if (!RemoteRuntime.pairingManager.isValid(credential)) {
-                            close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "Credential revoked"))
-                            break
-                        }
-                        val frame = capture.capture() ?: capture.latestFrame()
-                        if (frame != null) {
-                            if (frame.revision != lastRevision) {
-                                send(Frame.Text(codec.encodeToString(StreamHello.serializer(), StreamHello(
-                                    width = frame.width, height = frame.height,
-                                    rotation = frame.rotation, revision = frame.revision
-                                ))))
-                                lastRevision = frame.revision
-                            }
-                            send(Frame.Binary(true, frame.jpeg))
-                        }
-                        delay(1000L / fps)
+                    val fps = AtomicInteger(5)
+                    val first = capture.capture() ?: capture.latestFrame()
+                    if (first == null) {
+                        close()
+                        return@webSocket
                     }
-                } finally {
-                    commandJob.cancel()
-                }
+                    send(Frame.Text(codec.encodeToString(StreamHello.serializer(), StreamHello(
+                        width = first.width,
+                        height = first.height,
+                        rotation = first.rotation,
+                        revision = first.revision, sequence = first.sequence,
+                        sourceWidth = first.geometry.sourceWidth, sourceHeight = first.geometry.sourceHeight,
+                    ))))
+                    val commandJob = launch {
+                        for (frame in incoming) {
+                            if (frame is Frame.Text) {
+                                runCatching { codec.decodeFromString(QualityRequest.serializer(), frame.readText()) }
+                                    .getOrNull()?.let { request -> request.fps?.let { fps.set(it.coerceIn(1, 15)) } }
+                            }
+                        }
+                    }
+                    try {
+                        var lastRevision = first.revision
+                        while (isActive) {
+                            if (!RemoteRuntime.pairingManager.isValid(credential)) {
+                                close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "Credential revoked"))
+                                break
+                            }
+                            val frame = capture.capture() ?: capture.latestFrame()
+                            if (frame != null) {
+                                if (frame.revision != lastRevision) {
+                                    send(Frame.Text(codec.encodeToString(StreamHello.serializer(), StreamHello(
+                                        width = frame.width, height = frame.height,
+                                        rotation = frame.rotation, revision = frame.revision
+                                    ))))
+                                    lastRevision = frame.revision
+                                }
+                                withTimeout(5_000) {
+                                    send(Frame.Text(codec.encodeToString(StreamHello.serializer(), StreamHello(
+                                        type = "frame", width = frame.width, height = frame.height,
+                                        rotation = frame.rotation, revision = frame.revision, sequence = frame.sequence,
+                                        sourceWidth = frame.geometry.sourceWidth, sourceHeight = frame.geometry.sourceHeight,
+                                    ))))
+                                    send(Frame.Binary(true, frame.jpeg))
+                                }
+                            }
+                            delay(1000L / fps.get())
+                        }
+                    } finally {
+                        commandJob.cancel()
+                    }
+                } finally { streamSlots.release() }
             }
         }
     }
@@ -280,7 +300,7 @@ class HttpServer(
         y: Float,
         space: String,
         expectedRevision: Long?
-    ): Pair<Int, Int>? {
+    ): ResolvedPoint? {
         val current = capture.latestFrame() ?: capture.capture()
         if (current == null) {
             respondError(HttpStatusCode.ServiceUnavailable, "CAPTURE_UNAVAILABLE", "No screenshot is available")
@@ -294,12 +314,25 @@ class HttpServer(
             respondError(HttpStatusCode.BadRequest, "INVALID_COORDINATE", "Coordinates must be normalized values between 0 and 1")
             return null
         }
-        return (x * current.width).roundToInt().coerceIn(0, current.width - 1) to
-            (y * current.height).roundToInt().coerceIn(0, current.height - 1)
+        val point = current.geometry.point(x, y)
+        return ResolvedPoint(point.first, point.second, current.revision)
+    }
+
+    private data class ResolvedPoint(val x: Int, val y: Int, val revision: Long)
+
+    private suspend fun io.ktor.server.application.ApplicationCall.respondGesture(result: GestureResult?) {
+        when (result) {
+            GestureResult.COMPLETED -> respond(mapOf("accepted" to true, "completed" to true))
+            GestureResult.BUSY -> respondError(HttpStatusCode.Conflict, "INPUT_BUSY", "Wait for the current gesture to complete")
+            GestureResult.SCREEN_CHANGED -> respondError(HttpStatusCode.Conflict, "SCREEN_CHANGED", "Take a new screenshot before retrying")
+            GestureResult.CANCELLED -> respondError(HttpStatusCode.Conflict, "GESTURE_CANCELLED", "The system cancelled the gesture; observe the screen before retrying")
+            GestureResult.TIMEOUT -> respondError(HttpStatusCode.GatewayTimeout, "GESTURE_TIMEOUT", "Gesture completion was not confirmed; observe the screen before retrying")
+            else -> respondError(HttpStatusCode.ServiceUnavailable, "ACCESSIBILITY_UNAVAILABLE", "Capture or accessibility service is unavailable")
+        }
     }
 
     private fun deviceStatus(): DeviceStatus {
-        val metrics: DisplayMetrics = context.resources.displayMetrics
+        val display = PlatformCapabilities.displayGeometry(context)
         val frame = capture.latestFrame()
         return DeviceStatus(
             deviceName = Build.MODEL,
@@ -308,11 +341,17 @@ class HttpServer(
             accessibilityConnected = RemoteAccessibilityService.connected.get(),
             serverRunning = engine != null,
             lanEnabled = bindLan,
-            width = frame?.width ?: metrics.widthPixels,
-            height = frame?.height ?: metrics.heightPixels,
-            rotation = frame?.rotation ?: context.resources.configuration.orientation,
+            width = frame?.width ?: display.width,
+            height = frame?.height ?: display.height,
+            rotation = frame?.rotation ?: display.rotation,
             screenRevision = frame?.revision ?: 0,
-            captureMode = capture.captureMode()
+            captureMode = capture.captureMode(),
+            captureState = capture.captureState(),
+            controlReady = frame != null && RemoteAccessibilityService.connected.get(),
+            sourceWidth = frame?.geometry?.sourceWidth ?: display.width,
+            sourceHeight = frame?.geometry?.sourceHeight ?: display.height,
+            frameSequence = frame?.sequence ?: 0,
+            lastError = RemoteRuntime.state.value.message,
         )
     }
 
