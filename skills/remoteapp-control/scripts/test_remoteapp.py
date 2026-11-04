@@ -8,6 +8,10 @@ import os
 from pathlib import Path
 import socket
 import struct
+import ssl
+import subprocess
+import shutil
+from unittest import mock
 import tempfile
 import threading
 import unittest
@@ -59,6 +63,14 @@ class ClientTests(unittest.TestCase):
                 client.json("GET", "/api/v1/redirect")
             self.assertEqual(calls[:3], [("/api/v1/device", "test-key", None), ("/api/v1/health", None, None), ("/api/v1/device", None, "Bearer test-session")])
             self.assertFalse(any(path == "/must-not-follow" for path, _, _ in calls))
+            args = remoteapp.parser().parse_args(["--url", f"127.0.0.1:{server.server_port}", "--no-proxy", "--ask-key", "device"])
+            with mock.patch("sys.stdin.isatty", return_value=False), mock.patch("getpass.getpass") as prompt:
+                with self.assertRaisesRegex(remoteapp.ClientError, "TTY"):
+                    remoteapp.run(args)
+                prompt.assert_not_called()
+            with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("getpass.getpass", return_value="hidden-key"):
+                self.assertTrue(remoteapp.run(args)["ok"])
+            self.assertEqual(calls[-1], ("/api/v1/device", "hidden-key", None))
         finally:
             server.shutdown()
             server.server_close()
@@ -106,6 +118,112 @@ class ClientTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_tunnel_https_required_and_proxy_bypass(self):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+            def do_GET(self):
+                if self.path.endswith("health"):
+                    self.send_response(501)
+                    self.end_headers()
+                    self.wfile.write("SakuraFrp 自动 HTTPS".encode())
+                else:
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b'{"ok":true}')
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            url = f"127.0.0.1:{server.server_port}"
+            client = remoteapp.Client(url, "test-key", no_proxy=True)
+            with self.assertRaisesRegex(remoteapp.ClientError, "HTTPS_REQUIRED"):
+                client.json("GET", "/api/v1/health", auth="none")
+            with mock.patch("urllib.request.getproxies", return_value={"http": "http://127.0.0.1:1"}), mock.patch("urllib.request.proxy_bypass", return_value=False):
+                with self.assertRaisesRegex(remoteapp.ClientError, "CONNECTION_FAILED"):
+                    remoteapp.Client(url, "test-key", timeout=1).json("GET", "/api/v1/device")
+                self.assertTrue(remoteapp.Client(url, "test-key", no_proxy=True).json("GET", "/api/v1/device")["ok"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is needed to generate a local TLS fixture")
+    def test_custom_certificate_and_service_name_verify_http_and_websocket(self):
+        requests = []
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+            def do_GET(self):
+                requests.append((self.path, self.headers.get("X-API-Key")))
+                if self.path.endswith("stream"):
+                    nonce = self.headers["Sec-WebSocket-Key"]
+                    accept = base64.b64encode(hashlib.sha1((nonce + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+                    self.send_response(101)
+                    self.send_header("Upgrade", "websocket")
+                    self.send_header("Connection", "Upgrade")
+                    self.send_header("Sec-WebSocket-Accept", accept)
+                    self.end_headers()
+                    meta = json.dumps({"type": "frame", "revision": 19, "width": 10, "height": 20}).encode()
+                    self.wfile.write(bytes([0x81, len(meta)]) + meta + b"\x82\x06\xff\xd8ok\xff\xd9")
+                    self.wfile.flush()
+                    for _ in range(2):
+                        first, second = remoteapp.read_exact(self.connection, 2)
+                        remoteapp.read_exact(self.connection, 4 + (second & 127))
+                else:
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b'{"ok":true}')
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            config = folder / "openssl.cnf"
+            config.write_text("[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=phone.example.test\n[ext]\nsubjectAltName=DNS:phone.example.test\nbasicConstraints=critical,CA:TRUE\n")
+            cert, key = folder / "cert.pem", folder / "key.pem"
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-config", str(config), "-keyout", str(key), "-out", str(cert)], check=True, capture_output=True)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(cert, key)
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                url = f"https://127.0.0.1:{server.server_port}"
+                for options in ({}, {"ca_file": cert}, {"ca_file": cert, "tls_server_name": "wrong.example.test"}):
+                    with self.assertRaisesRegex(remoteapp.ClientError, "TLS_CERTIFICATE_INVALID"):
+                        remoteapp.Client(url, "not-sent", no_proxy=True, **options).json("GET", "/api/v1/device")
+                self.assertEqual(requests, [])
+                client = remoteapp.Client(url, "test-key", ca_file=cert, tls_server_name="phone.example.test", no_proxy=True)
+                self.assertTrue(client.tls_context.check_hostname)
+                self.assertTrue(client.json("GET", "/api/v1/device")["ok"])
+                result = remoteapp.capture_stream(client, str(folder / "frames"), frames=1)
+                self.assertEqual(result["metadata"]["revision"], 19)
+                self.assertEqual(requests, [("/api/v1/device", "test-key"), ("/api/v1/stream", "test-key")])
+                with self.assertRaisesRegex(remoteapp.ClientError, "https://"):
+                    remoteapp.Client("http://127.0.0.1:1234", ca_file=cert)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_paused_stream_fails_promptly_without_saving_stale_pixels(self):
+        connection, peer = socket.socketpair()
+        def server():
+            with peer:
+                raw = bytearray()
+                while not raw.endswith(b"\r\n\r\n"):
+                    raw.extend(peer.recv(1))
+                nonce = next(line.split(": ", 1)[1] for line in raw.decode().split("\r\n") if line.startswith("Sec-WebSocket-Key:"))
+                accept = base64.b64encode(hashlib.sha1((nonce + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+                peer.sendall(f"HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: {accept}\r\n\r\n".encode())
+                state = b'{"type":"state","captureState":"screen_off"}'
+                peer.sendall(bytes([0x81, len(state)]) + state)
+                peer.settimeout(3)
+                peer.recv(1024)
+        worker = threading.Thread(target=server, daemon=True)
+        worker.start()
+        with tempfile.TemporaryDirectory() as temp, mock.patch("remoteapp.socket.create_connection", return_value=connection):
+            with self.assertRaisesRegex(remoteapp.ClientError, "screen is off"):
+                remoteapp.capture_stream(remoteapp.Client("127.0.0.1:1234", "test-key"), temp)
+            self.assertEqual(list(Path(temp).iterdir()), [])
+        worker.join(4)
+        self.assertFalse(worker.is_alive())
 
     def test_websocket_handshake_fragmentation_ping_and_capture(self):
         listener = socket.socket()

@@ -22,6 +22,10 @@ python3 <skill-dir>/scripts/remoteapp.py --url 192.168.1.20:8765 --key-file /pri
 
 设置 `REMOTEAPP_URL` 后可省略 `--url`，设置 `REMOTEAPP_API_KEY` 后可省略 `--key-file`。示例文件路径必须替换成用户实际提供的位置；不要把 Key 写进示例命令。仅在用户要求结束/撤销授权时调用会话撤销接口。
 
+## 隧道与 HTTPS
+
+遇到 SakuraFrp 的“自动 HTTPS”501错误、TLS证书失败或系统代理干扰时，阅读 [references/connection.md](references/connection.md)。客户端支持 `--ca-file`、`--tls-server-name`、`--no-proxy`，保留证书验证，不自动跟随跳转/重试操作。用户已在聊天提供Key时，可用 `--ask-key` 配合TTY隐藏输入，避免将Key写进shell命令或重复索要。
+
 ## 观察 → 操作 → 验证
 
 1. 读取 `device`，检查无障碍连接和 `controlReady`；旧版本没有该字段时，结合截图成功和 `accessibilityConnected` 判断。
@@ -51,7 +55,7 @@ python3 <skill-dir>/scripts/remoteapp.py --url 192.168.1.20:8765 action BACK
 
 阅读 [references/api.md](references/api.md) 获取所有接口、登录、配对、票据、会话撤销和错误契约。脚本的 `request GET|POST /api/v1/...` 支持现有 API 的直接调用；有请求体时用 `--json-file`，敏感响应可用 `--output` 私密保存。无需自行拼接 curl 或重写 WebSocket 握手。
 
-当前 API 不提供输入文字、应用安装/启动、任意键码、多指或 shell 能力。需要输入文字时只能在明确任务范围内观察屏幕键盘并操作现有手势；不要臆造接口或自动转用 ADB。
+当前 API 不提供输入文字、应用安装/启动、任意键码、多指或 shell 能力。需要输入文字时，可按任务范围写入手机剪贴板再通过界面粘贴，或操作屏幕键盘；不要臆造接口或自动转用 ADB。
 
 ## 错误与停止条件
 

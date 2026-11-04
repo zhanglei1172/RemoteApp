@@ -24,7 +24,7 @@
 | POST | `/stream-ticket` | `ticket --save-ticket file` | 30秒单次票据，绑定原凭据 |
 | WS | `/stream` | `stream --output-dir dir` | 认证头直接连接，或 --ticket-file 使用票据 |
 
-`--url`、`--key-file`、`--token-file`、`--timeout` 是全局选项，写在子命令之前。认证环境变量为 `REMOTEAPP_API_KEY` 和 `REMOTEAPP_SESSION_TOKEN`，两者都有时默认优先 Key；撤销单会话强制使用 session。HTTP 客户端不跟随重定向，不自动重试任何手势或认证请求。
+`--url`、`--key-file`、`--ask-key`、`--token-file`、`--timeout`、`--ca-file`、`--tls-server-name`、`--no-proxy` 是全局选项，写在子命令之前。认证环境变量为 `REMOTEAPP_API_KEY` 和 `REMOTEAPP_SESSION_TOKEN`，两者都有时默认优先 Key；撤销单会话强制使用 session。HTTP 客户端不跟随重定向，不自动重试任何手势或认证请求。
 
 ## 登录、配对和会话
 
@@ -74,3 +74,5 @@ WS 首条文本为 `type:hello`，含 width/height/rotation/revision/format=jpeg
 画面流可发送 `{"type":"state","captureState":"screen_off|starting|unavailable"}`（实际字段取单一状态）。收到状态消息应废弃旧图/坐标；只有后续hello/frame提供可用于JPEG的几何信息。亮屏请求不解除安全锁屏，也不恢复系统已撤销的录屏授权。
 
 `/device`提供lockAvailable和lockPermissionRequired。主动锁屏是明确改变设备状态的动作，应属于用户任务范围；Android8首次需手机用户激活仅force-lock的管理员权限，不能通过API批准。LOCK_REJECTED/LOCK_DENIED表示系统拒绝，不盲目重试。锁屏后按screen_off状态处理，保留连接但不得盲用旧坐标。
+
+隧道自动HTTPS、证书服务名与系统代理的排查方法见 [connection.md](connection.md)。有限帧采样遇到 `type:state` 会立即以 `CAPTURE_NOT_READY` 退出、不保存旧图；Agent先检查device，按screen_off或授权状态处理后再采样。

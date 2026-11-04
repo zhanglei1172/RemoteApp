@@ -3,6 +3,8 @@
 import argparse
 import base64
 import hashlib
+import getpass
+import http.client
 import json
 import math
 import os
@@ -74,13 +76,44 @@ def redact(value):
     return value
 
 
+class NamedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, *, server_name=None, **kwargs):
+        super().__init__(host, **kwargs)
+        self.server_name = server_name
+
+    def connect(self):
+        # Preserve HTTP CONNECT routing but verify TLS using the explicitly configured service name.
+        http.client.HTTPConnection.connect(self)
+        self.sock = self._context.wrap_socket(self.sock,
+            server_hostname=self.server_name or self._tunnel_host or self.host)
+
+
+class NamedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, context, server_name):
+        super().__init__(context=context)
+        self.server_name = server_name
+
+    def https_open(self, request):
+        return self.do_open(lambda host, **kwargs: NamedHTTPSConnection(
+            host, context=self._context, server_name=self.server_name, **kwargs), request)
+
+
 class Client:
-    def __init__(self, url, key="", token="", timeout=15):
+    def __init__(self, url, key="", token="", timeout=15, *, ca_file=None, no_proxy=False, tls_server_name=None):
         self.url = base_url(url)
         self.key = key
         self.token = token
         self.timeout = timeout
-        self.opener = urllib.request.build_opener(NoRedirect)
+        if tls_server_name and any(char in tls_server_name for char in ("/", ":", "@", "\r", "\n", " ")):
+            raise ClientError("TLS server name must be a hostname, without port or URL")
+        if (ca_file or tls_server_name) and urllib.parse.urlsplit(self.url).scheme != "https":
+            raise ClientError("TLS options require an explicit https:// URL")
+        self.tls_server_name = tls_server_name
+        self.tls_context = ssl.create_default_context(cafile=str(Path(ca_file).expanduser()) if ca_file else None)
+        handlers = [NoRedirect, NamedHTTPSHandler(self.tls_context, tls_server_name)]
+        if no_proxy:
+            handlers.append(urllib.request.ProxyHandler({}))
+        self.opener = urllib.request.build_opener(*handlers)
 
     def headers(self, auth="auto"):
         if auth == "none":
@@ -101,11 +134,17 @@ class Client:
             response = self.opener.open(request, timeout=self.timeout)
         except urllib.error.HTTPError as error:
             response = error
+        except urllib.error.URLError as error:
+            if isinstance(error.reason, ssl.SSLCertVerificationError):
+                raise ClientError("TLS_CERTIFICATE_INVALID: check the tunnel certificate, --ca-file and --tls-server-name; no credentials were sent over TLS") from None
+            raise ClientError("CONNECTION_FAILED: check the supplied address, tunnel and proxy; --no-proxy bypasses HTTP system proxies") from None
         with response:
             payload = response.read(MAX_MESSAGE + 1)
             if len(payload) > MAX_MESSAGE:
                 raise ClientError("Response exceeds the capture size limit")
             if not 200 <= response.code < 300:
+                if response.code == 501 and "自动 HTTPS" in payload.decode("utf-8", errors="replace"):
+                    raise ClientError("HTTPS_REQUIRED: this tunnel enables automatic HTTPS; check health using https:// on the same host and port before authentication")
                 try:
                     detail = redact(json.loads(payload))
                 except (ValueError, UnicodeError):
@@ -179,7 +218,7 @@ def capture_stream(client, output_dir, frames=3, fps=5, ticket=""):
     connection = socket.create_connection((origin.hostname, origin.port), timeout=client.timeout)
     try:
         if origin.scheme == "https":
-            connection = ssl.create_default_context().wrap_socket(connection, server_hostname=origin.hostname)
+            connection = client.tls_context.wrap_socket(connection, server_hostname=client.tls_server_name or origin.hostname)
         nonce = base64.b64encode(secrets.token_bytes(16)).decode()
         path = "/api/v1/stream" + ("?ticket=" + urllib.parse.quote(ticket, safe="") if ticket else "")
         headers = {"Host": origin.netloc, "Upgrade": "websocket", "Connection": "Upgrade",
@@ -205,6 +244,13 @@ def capture_stream(client, output_dir, frames=3, fps=5, ticket=""):
             opcode, payload = read_message(connection)
             if opcode == 1:
                 message = json.loads(payload)
+                if message.get("type") == "state":
+                    metadata = None
+                    state = message.get("captureState")
+                    detail = {"screen_off": "screen is off; use power/wake when needed",
+                              "unavailable": "screen sharing needs phone-side authorization",
+                              "starting": "capture is starting; check device before sampling again"}.get(state, "capture is not ready; check device")
+                    raise ClientError("CAPTURE_NOT_READY: " + detail)
                 if message.get("type") in ("hello", "frame"):
                     metadata = message
                 continue
@@ -248,9 +294,13 @@ def revision(args):
 def parser():
     root = argparse.ArgumentParser(description=__doc__)
     root.add_argument("--url", default=os.environ.get("REMOTEAPP_URL", ""), help="IP:port or http(s)://host:port")
+    root.add_argument("--ask-key", action="store_true", help="Read API Key interactively without echo; do not put it in argv")
     root.add_argument("--key-file", help="Private file containing API Key; alternatively REMOTEAPP_API_KEY")
     root.add_argument("--token-file", help="Private file containing session token; alternatively REMOTEAPP_SESSION_TOKEN")
     root.add_argument("--timeout", type=float, default=15)
+    root.add_argument("--ca-file", help="Trusted PEM CA or self-signed tunnel certificate; HTTPS only")
+    root.add_argument("--tls-server-name", help="Configured TLS service hostname for SNI and certificate verification; routing address stays unchanged")
+    root.add_argument("--no-proxy", action="store_true", help="Bypass system proxies for HTTP(S); WebSocket connections are already direct")
     sub = root.add_subparsers(dest="command", required=True)
     for command in ("health", "device", "revoke-session", "revoke-all"):
         sub.add_parser(command)
@@ -292,8 +342,14 @@ def run(args):
         raise ClientError("Provide the phone IP and port with --url or REMOTEAPP_URL")
     if not 0 < args.timeout <= 120:
         raise ClientError("Timeout must be in (0,120] seconds")
-    client = Client(args.url, secret_value(args.key_file, "REMOTEAPP_API_KEY"),
-                    secret_value(args.token_file, "REMOTEAPP_SESSION_TOKEN"), args.timeout)
+    if args.ask_key and not sys.stdin.isatty():
+        raise ClientError("--ask-key requires a TTY for hidden input; otherwise use a private key file or environment variable")
+    key = getpass.getpass("API Key: ").strip() if args.ask_key else secret_value(args.key_file, "REMOTEAPP_API_KEY")
+    if "\r" in key or "\n" in key:
+        raise ClientError("Credential must contain a single header value")
+    client = Client(args.url, key,
+                    secret_value(args.token_file, "REMOTEAPP_SESSION_TOKEN"), args.timeout,
+                    ca_file=args.ca_file, no_proxy=args.no_proxy, tls_server_name=args.tls_server_name)
     command = args.command
     if command in ("health", "device"):
         return client.json("GET", "/api/v1/" + command, auth="none" if command == "health" else "auto")
