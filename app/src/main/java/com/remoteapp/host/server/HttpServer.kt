@@ -1,5 +1,13 @@
 package com.remoteapp.host.server
 
+import com.remoteapp.host.platform.PhoneClipboard
+import com.remoteapp.host.domain.ClipboardRequest
+import android.app.KeyguardManager
+import android.os.PowerManager
+import com.remoteapp.host.domain.PowerResponse
+import com.remoteapp.host.platform.ScreenLock
+import com.remoteapp.host.platform.ScreenLockResult
+import com.remoteapp.host.domain.CaptureStateMessage
 import android.content.Context
 import android.os.Build
 import com.remoteapp.host.accessibility.GestureResult
@@ -119,6 +127,46 @@ class HttpServer(
                 if (!call.authorized()) return@get
                 call.respond(deviceStatus())
             }
+            post("/api/v1/power/lock") {
+                if (!call.authorized()) return@post
+                try {
+                    when (withContext(Dispatchers.Main.immediate) { ScreenLock.request(context) }) {
+                        ScreenLockResult.ACCEPTED -> {
+                            delay(500)
+                            call.respond(PowerResponse(true, context.getSystemService(PowerManager::class.java).isInteractive,
+                                context.getSystemService(KeyguardManager::class.java).isKeyguardLocked))
+                        }
+                        ScreenLockResult.PERMISSION_REQUIRED -> call.respondError(HttpStatusCode.Conflict,
+                            "LOCK_PERMISSION_REQUIRED", "On Android 8, enable the screen lock permission in RemoteApp on the phone")
+                        ScreenLockResult.UNAVAILABLE -> call.respondError(HttpStatusCode.ServiceUnavailable,
+                            "ACCESSIBILITY_UNAVAILABLE", "Enable the accessibility service on the phone")
+                        ScreenLockResult.REJECTED -> call.respondError(HttpStatusCode.Conflict,
+                            "LOCK_REJECTED", "Android did not accept the lock request; check the phone")
+                    }
+                } catch (_: SecurityException) {
+                    call.respondError(HttpStatusCode.Forbidden, "LOCK_DENIED", "Android denied screen lock; check the phone permissions")
+                }
+            }
+            post("/api/v1/power/wake") {
+                if (!call.authorized()) return@post
+                val service = RemoteAccessibilityService.instance
+                if (service == null) {
+                    call.respondError(HttpStatusCode.ServiceUnavailable, "ACCESSIBILITY_UNAVAILABLE", "Enable the accessibility service on the phone")
+                    return@post
+                }
+                try {
+                    val wakeLock = withContext(Dispatchers.Main.immediate) { PlatformCapabilities.requestScreenWake(service) }
+                    try {
+                        delay(900)
+                    } finally {
+                        wakeLock?.let { if (it.isHeld) it.release() }
+                    }
+                    call.respond(PowerResponse(true, context.getSystemService(PowerManager::class.java).isInteractive,
+                        context.getSystemService(KeyguardManager::class.java).isKeyguardLocked))
+                } catch (_: SecurityException) {
+                    call.respondError(HttpStatusCode.Forbidden, "WAKE_DENIED", "Android denied screen wake; turn on the screen on the phone")
+                }
+            }
             get("/api/v1/screen") {
                 if (!call.authorized()) return@get
                 val frame = capture.capture() ?: capture.latestFrame()
@@ -134,6 +182,36 @@ class HttpServer(
                     call.response.headers.append("X-Frame-Sequence", frame.sequence.toString())
                     call.response.headers.append("X-Frame-Age-Ms", (android.os.SystemClock.elapsedRealtime() - frame.capturedAtMs).toString())
                     call.respondBytes(frame.jpeg, ContentType.Image.JPEG)
+                }
+            }
+            get("/api/v1/clipboard") {
+                if (!call.authorized()) return@get
+                try {
+                    call.respond(withContext(Dispatchers.Main.immediate) { PhoneClipboard.read(context) })
+                } catch (error: IllegalStateException) {
+                    val foreground = error.message == "CLIPBOARD_FOREGROUND_REQUIRED"
+                    call.respondError(HttpStatusCode.Conflict,
+                        if (foreground) "CLIPBOARD_FOREGROUND_REQUIRED" else "CLIPBOARD_NOT_TEXT",
+                        if (foreground) "Open RemoteApp on the phone and keep it in the foreground to read the clipboard"
+                        else "The phone clipboard does not contain plain text")
+                } catch (_: IllegalArgumentException) {
+                    call.respondError(HttpStatusCode.PayloadTooLarge, "CLIPBOARD_TOO_LARGE", "Clipboard text exceeds 65536 UTF-16 code units")
+                } catch (_: SecurityException) {
+                    call.respondError(HttpStatusCode.Forbidden, "CLIPBOARD_ACCESS_DENIED", "Android denied clipboard access")
+                }
+            }
+            post("/api/v1/clipboard") {
+                if (!call.authorized()) return@post
+                val request = call.receive<ClipboardRequest>()
+                if (request.text.length > PhoneClipboard.MAX_TEXT_LENGTH) {
+                    call.respondError(HttpStatusCode.PayloadTooLarge, "CLIPBOARD_TOO_LARGE", "Clipboard text exceeds 65536 UTF-16 code units")
+                    return@post
+                }
+                try {
+                    withContext(Dispatchers.Main.immediate) { PhoneClipboard.write(context, request.text) }
+                    call.respond(mapOf("accepted" to true))
+                } catch (_: SecurityException) {
+                    call.respondError(HttpStatusCode.Forbidden, "CLIPBOARD_ACCESS_DENIED", "Android denied clipboard access")
                 }
             }
             post("/api/v1/pairing/claim") {
@@ -220,11 +298,7 @@ class HttpServer(
                 try {
                     val fps = AtomicInteger(5)
                     val first = capture.capture() ?: capture.latestFrame()
-                    if (first == null) {
-                        close()
-                        return@webSocket
-                    }
-                    send(Frame.Text(codec.encodeToString(StreamHello.serializer(), StreamHello(
+                    if (first != null) send(Frame.Text(codec.encodeToString(StreamHello.serializer(), StreamHello(
                         width = first.width,
                         height = first.height,
                         rotation = first.rotation,
@@ -240,14 +314,20 @@ class HttpServer(
                         }
                     }
                     try {
-                        var lastRevision = first.revision
+                        var lastRevision = first?.revision ?: -1L
+                        var lastCaptureState: String? = null
                         while (isActive) {
                             if (!RemoteRuntime.pairingManager.isValid(credential)) {
                                 close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "Credential revoked"))
                                 break
                             }
                             val frame = capture.capture() ?: capture.latestFrame()
-                            if (frame != null) {
+                            if (frame == null) {
+                                val state = capture.captureState()
+                                if (state != lastCaptureState) send(Frame.Text(codec.encodeToString(CaptureStateMessage.serializer(), CaptureStateMessage(captureState = state))))
+                                lastCaptureState = state
+                            } else {
+                                lastCaptureState = null
                                 if (frame.revision != lastRevision) {
                                     send(Frame.Text(codec.encodeToString(StreamHello.serializer(), StreamHello(
                                         width = frame.width, height = frame.height,
@@ -352,6 +432,12 @@ class HttpServer(
             sourceHeight = frame?.geometry?.sourceHeight ?: display.height,
             frameSequence = frame?.sequence ?: 0,
             lastError = RemoteRuntime.state.value.message,
+            screenInteractive = context.getSystemService(PowerManager::class.java).isInteractive,
+            keyguardLocked = context.getSystemService(KeyguardManager::class.java).isKeyguardLocked,
+            keyguardSecure = context.getSystemService(KeyguardManager::class.java).isKeyguardSecure,
+            captureConsentRequired = !capture.hasSession(),
+            lockAvailable = ScreenLock.available(context),
+            lockPermissionRequired = ScreenLock.permissionRequired(context),
         )
     }
 

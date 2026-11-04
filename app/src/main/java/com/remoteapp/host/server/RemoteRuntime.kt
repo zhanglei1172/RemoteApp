@@ -35,7 +35,7 @@ object RemoteRuntime {
     fun updateState(phase: HostPhase, message: String? = null) { mutableState.value = HostState(phase, message) }
 
     fun startWithProjection(context: Context, allowLan: Boolean, resultCode: Int, data: Intent) {
-        if (server != null || state.value.phase == HostPhase.STARTING) return
+        if ((server != null && captureManager.hasSession()) || state.value.phase == HostPhase.STARTING) return
         applicationContext = context.applicationContext
         lanEnabled = allowLan
         updateState(HostPhase.STARTING)

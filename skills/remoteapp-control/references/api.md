@@ -8,10 +8,14 @@
 | --- | --- | --- | --- |
 | GET | `/health` | `health` | 无需认证；ok/server/port |
 | GET | `/device` | `device` | 无障碍、捕获方式、画面尺寸/旋转/revision、LAN；新版本含 controlReady、captureState、sourceWidth/Height、displayId、frameSequence、lastError |
+| GET | `/clipboard` | `request GET /api/v1/clipboard --output file` | `{text,hasText}`；Android10+需RemoteApp前台焦点 |
+| POST | `/clipboard` | `request POST /api/v1/clipboard --json-file file` | `{text}`；上限65536 UTF-16单元，空文本覆盖 |
 | GET | `/screen` | `screen --output path.jpg` | JPEG；保存头信息至 path.jpg.json |
 | POST | `/input/tap` | `tap x y --meta file` | x/y、可选 space=normalized、screenRevision |
 | POST | `/input/long-press` | `long-press x y --meta file` | 同 tap，约 700ms |
 | POST | `/input/swipe` | `swipe x y to_x to_y --meta file` | from/to、durationMs（80–10000，默认450）、screenRevision |
+| POST | `/power/lock` | `request POST /api/v1/power/lock` | 主动锁屏；Android8需本地设备管理授权，缺少时409 LOCK_PERMISSION_REQUIRED |
+| POST | `/power/wake` | `request POST /api/v1/power/wake` | 请求亮屏；返回accepted/screenInteractive/keyguardLocked，不解除安全锁屏 |
 | POST | `/system-action` | `action BACK` | BACK/HOME/RECENTS/NOTIFICATIONS |
 | POST | `/auth/login` | `login --save-session file` | password；返回 token，脚本保存而不打印 |
 | POST | `/pairing/claim` | `pair --save-session file` | code；一次性6位配对码，手机生成后5分钟内有效 |
@@ -63,4 +67,10 @@ WS 首条文本为 `type:hello`，含 width/height/rotation/revision/format=jpeg
 | 503 CAPTURE_UNAVAILABLE、ACCESSIBILITY_UNAVAILABLE | 检查手机服务/授权；不操作旧图 |
 | 504 GESTURE_TIMEOUT | 完成状态未知，控制可能已停止，回手机恢复 |
 
-捕获失效、熄屏或无障碍断开后，新版会关闭控制服务；用户需要在手机恢复权限、解锁并重新允许整屏录制。网络超时也可能来自 AP 隔离、VPN 或地址变化；按用户给出的地址排查，不自动扩大网络暴露。
+熄屏保留HTTP/认证连接，captureState=screen_off；请求power/wake后检查screenInteractive和controlReady并重新观察截图。系统撤销投影时captureConsentRequired=true，连接保留，需手机用户重新授权共享；无障碍断开仍关闭服务，需手机恢复权限和重启。网络超时也可能来自 AP 隔离、VPN 或地址变化；按用户给出的地址排查，不自动扩大网络暴露。
+
+剪贴板错误：409 CLIPBOARD_FOREGROUND_REQUIRED / CLIPBOARD_NOT_TEXT，413 CLIPBOARD_TOO_LARGE，403 CLIPBOARD_ACCESS_DENIED。读取/写入不自动粘贴或同步，不应记录响应内容。
+
+画面流可发送 `{"type":"state","captureState":"screen_off|starting|unavailable"}`（实际字段取单一状态）。收到状态消息应废弃旧图/坐标；只有后续hello/frame提供可用于JPEG的几何信息。亮屏请求不解除安全锁屏，也不恢复系统已撤销的录屏授权。
+
+`/device`提供lockAvailable和lockPermissionRequired。主动锁屏是明确改变设备状态的动作，应属于用户任务范围；Android8首次需手机用户激活仅force-lock的管理员权限，不能通过API批准。LOCK_REJECTED/LOCK_DENIED表示系统拒绝，不盲目重试。锁屏后按screen_off状态处理，保留连接但不得盲用旧坐标。

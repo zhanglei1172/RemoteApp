@@ -49,3 +49,23 @@ npx tsc --noEmit --target ES2020 --module ESNext --moduleResolution bundler --li
 ## 历史认证验证
 
 2026-11-03 的原实现曾在相同 Android 8 设备验证密码设置/登录、错误密码退避、密码格式迁移、Key 轮换使旧流和票据失效、会话撤销与 Key 相互独立、进程重启持久化，以及真实 LAN 直连认证与关闭 LAN 后拒绝连接。该轮临时密码和 Key 已恢复、清理；这些结果不代替新版厂商设备验证。
+
+## 2026-11-04 网页剪贴板验证
+
+仅在当前连接的 MI 5（Android 8 / API 26）进行一轮真机验证，安装更新不清除应用数据、不变更密码或 API Key。通过 GET/POST `/api/v1/clipboard` 验证中文、多行、emoji、首尾空白、后台读写和空文本覆盖；未认证 GET/POST 返回401，缺少text返回400，超过65536 UTF-16单元返回413。测试后恢复原剪贴板文字、停止服务并清理转发与私密测试材料。
+
+Chrome 320×568移动视口连接该真机服务，验证网页实际读写、空文本覆盖、无横向溢出和至少44px按钮；另用响应模拟验证Android10+前台读取限制的提示、401后清空文本及无页面异常。此项是桌面Chrome移动视口检查，不等同于厂商手机浏览器实测；Android10+系统行为未另做真机验收。
+
+Web构建、TypeScript类型检查、Android打包、14项JVM单测及lint通过（0错误，8项既有警告）；Skill客户端5项本地测试及skill校验通过。
+
+## 2026-11-04 熄屏保持连接与主动锁屏验收
+
+最终版本完成Web构建/TypeScript检查、APK打包、14项JVM测试、Android lint（0错误、8项既有警告）、Skill客户端5项测试及校验。仅使用同一台MI 5，USB断开后改用该设备既有无线ADB；没有运行其他设备或模拟器。
+
+初步验证观察到熄屏后HTTP仍可读取设备状态、captureState=screen_off且controlReady=false。该轮发现广播切换前的状态竞争，已改为同时检查系统实际亮屏状态。随后在同一MI 5继续验证：用调试器停止当前MediaProjection（测试专用，无生产API），确认HTTP、认证和原WebSocket保留，网页显示重新授权提示；在手机正常同意新的共享授权后，controlReady恢复、新revision生效且原WebSocket未重连。熄屏时画面/输入均返回503、网页清除旧画面并保留连接。
+
+MIUI拒绝了WakeActivity的锁屏显示权限，已改为Android8–12L使用最长1.5秒的旧版系统亮屏锁，Android13+继续使用独立唤醒页面。短暂熄屏广播延迟导致revision未更新的问题，已通过采样系统实际亮屏状态时同步清空旧帧并推进revision修复。最终版打包、14项单测和lint通过并已安装。已清理临时Key/UI数据、测试dex和端口转发，没有修改手机密码或API Key。
+
+用户在手机系统界面激活Android8仅force-lock的设备管理权限后，最终通过同一台MI 5验证：320×568网页实际调用power/lock锁屏、power/wake亮屏；HTTP/认证/同一条WebSocket全程保留；熄屏截图和输入返回503，网页清除旧图；亮屏新画面恢复且revision变化，旧坐标返回409；未认证锁屏/亮屏请求返回401；亮屏后keyguardLocked仍为true，没有解除系统密码锁。网页无横向溢出或JavaScript异常。文案断言由固定提示词改为真实连接/画面状态，未因此修改产品行为。
+
+本轮只使用当前MI 5；录屏撤销和新授权恢复用例在同一轮较早版本通过（随后修改仅限亮屏兼容、屏幕状态采样和新增锁屏）。未对Android9+无障碍锁屏、Android13+亮屏Activity、其他厂商、Doze长时间网络保活作新增真机声明。最终保留用户已启用的锁屏权限和远程服务运行，LAN保持关闭；移除临时调试连接/端口转发、测试dex及私密Key/UI材料。未修改手机系统密码或API Key。

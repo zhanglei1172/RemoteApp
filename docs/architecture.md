@@ -4,7 +4,7 @@
 
 RemoteApp 面向 Android 8（API 26）及以上：手机用户启用无障碍服务、确认系统整屏录制授权并启动服务后，Agent 或浏览器通过 HTTP/WebSocket 查看 JPEG 画面、执行手势和系统动作。默认仅监听 `127.0.0.1:8765`；用户打开 LAN 后监听 `0.0.0.0:8765`。HTTP 仅适用于可信网络或 VPN。
 
-密码和 API Key 长期保留，但捕获授权按会话申请。锁屏、熄屏、无障碍断开、系统停止共享或进程被杀后，不静默恢复控制，也不重放旧授权。受保护的窗口可能黑屏；不提供解锁、任意 shell、文件系统、多指事件或剪贴板控制接口。
+密码和 API Key 长期保留，但捕获授权按会话申请。锁屏/熄屏保留服务；关闭屏幕时不暴露旧画面、不发送盲触摸。若系统撤销录屏授权，连接保留，需手机用户重新同意共享，不重放旧授权。无障碍断开或进程被杀后不静默恢复控制。受保护的窗口可能黑屏；不提供解锁、任意 shell、文件系统、多指事件接口。
 
 兼容性决策及验收清单见 [android-compatibility.md](android-compatibility.md)，已执行结果见 [testing.md](testing.md)。
 
@@ -35,7 +35,7 @@ flowchart LR
 2. 授权成功后启动前台服务；API 29+ 显式使用 `mediaProjection` 类型，Manifest 声明对应普通权限及 API 34+ 类型权限。
 3. 服务进入前台后获取 MediaProjection，先注册生命周期回调，再创建唯一 VirtualDisplay。重复启动不重复消费授权或创建显示器。
 4. 有效首帧就绪后才开启 HTTP 监听并发布 Running；首帧超时、无障碍未连接、手机锁定或启动异常时停止服务并显示原因。
-5. 用户停止、熄屏、无障碍断开或投影 `onStop()` 时，先禁止读取旧画面和提交新输入，再停止监听并释放投影、ImageReader、Bitmap、线程及回调。
+5. 用户停止或无障碍断开时，先禁止读取旧画面和提交新输入，再停止监听并释放投影、ImageReader、Bitmap、线程及回调。熄屏时保留监听/投影，仅暂停画面和触摸、清除旧帧并推进revision；亮屏后使用新帧恢复。投影 `onStop()` 时释放捕获资源，保留HTTP监听/会话，等待用户重新授权。
 
 前台服务使用 `START_NOT_STICKY`，不通过开机广播恢复录屏。Activity 重建不重启运行中的捕获；仅保存待授权的 LAN 选择等非敏感界面状态。运行状态通过 StateFlow 更新，错误不会被“服务已启动”的乐观显示覆盖。
 
@@ -78,3 +78,19 @@ App 设置页可滚动、避让安全区和键盘，Key 按钮允许换行；运
 ## 已知边界
 
 厂商可能回收进程或禁用无障碍，设置页提供排查说明，但不承诺后台永久在线。没有完成验收的折叠屏、外接屏、多显示器和厂商浏览器不声明支持。模拟器验证系统 API，不能替代厂商设备上的电池策略、性能、锁屏和输入行为测试。
+
+## 剪贴板访问
+
+`GET/POST /api/v1/clipboard` 复用现有认证，仅显式读取/写入文本，最大 65536 UTF-16 单元。访问 Android ClipboardManager 在主线程进行，不持久化、不缓存、不记录内容，不主动轮询。Android 10+ 读取前检查 MainActivity 窗口焦点，后台返回明确的 409，避免系统拒读被当成空内容；不会自动拉起 Activity、申请悬浮窗或绕过系统限制。网页退出/认证失效时清空文本，并用会话世代检查丢弃退出前尚未完成的读取响应。普通 HTTP 传输保密性仍取决于可信网络/VPN。
+
+## 熄屏连接与远程唤醒
+
+服务监听 SCREEN_OFF / SCREEN_ON / USER_PRESENT，屏幕关闭时不编码/返回旧帧，`captureState=screen_off`。已有和新建WebSocket仍可连接，发送 `{"type":"state","captureState":"screen_off"}`；系统撤销投影后为 `unavailable`。网页清除旧画面、禁用坐标输入。恢复画面使用新revision，拒绝旧坐标。
+
+已认证的 `POST /api/v1/power/wake` 在Android 8–12L使用最长1.5秒的屏幕唤醒锁（请求结束主动释放），兼容旧MIUI对锁屏Activity的限制；Android13+通过已启用的无障碍服务启动短暂、独立且不导出的 WakeActivity，使用系统亮屏标志，随后关闭。该页面不显示应用配置、不调用dismissKeyguard、不输入密码；返回的screenInteractive表示实际亮屏状态，accepted仅表示请求提交。系统/厂商若禁止后台启动，用户需在手机亮屏。
+
+仅在远程服务存续期间持有有超时、定期续期的PARTIAL_WAKE_LOCK（WAKE_LOCK权限），保持CPU可处理网络请求，不持有常亮屏幕锁；服务销毁释放。此行为增加熄屏耗电，不保证绕过Doze网络限制或厂商进程回收。用户显式停止和无障碍断开仍关闭端口。Android新系统可能在锁屏撤销MediaProjection，保留服务不代表可以绕过新录屏同意或安全锁屏。
+
+## 主动锁屏
+
+已认证的POST `/api/v1/power/lock` 在主线程请求系统锁屏，不依赖可用画面。Android9+使用已有无障碍服务的GLOBAL_ACTION_LOCK_SCREEN；Android8仅在用户通过系统ACTION_ADD_DEVICE_ADMIN界面明确激活后使用DevicePolicyManager.lockNow。RemoteDeviceAdminReceiver受BIND_DEVICE_ADMIN保护，仅声明force-lock策略，不申请擦除、修改密码或监控登录等策略。未授权返回409，网页引导在手机启用，不远程批准授权。锁屏保留HTTP/会话；系统若停止投影，仍要求新的本地共享同意。Android8锁屏可能触发强认证，需要系统密码。管理员可由用户在系统设置正常停用，没有阻止停用的逻辑。

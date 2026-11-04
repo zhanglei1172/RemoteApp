@@ -14,10 +14,14 @@
 | --- | --- | --- |
 | `GET /health` | 无需认证 | 服务健康状态 |
 | `GET /device` | — | 设备、无障碍连接、捕获方式、尺寸、旋转和 `screenRevision` |
+| `GET /clipboard` | — | `{text,hasText}`，读取手机剪贴板文本 |
+| `POST /clipboard` | `{"text":"多行文本\n内容"}` | 写入手机剪贴板，返回 `{accepted:true}` |
 | `GET /screen` | — | JPEG；尺寸和 revision 见响应头 |
 | `POST /input/tap` | `{"x":0.5,"y":0.5}` | 点按 |
 | `POST /input/long-press` | `{"x":0.5,"y":0.5}` | 长按约 700ms |
 | `POST /input/swipe` | `{"from":{"x":0.5,"y":0.8},"to":{"x":0.5,"y":0.2},"durationMs":450}` | 滑动，时长限制在 80–10000ms |
+| `POST /power/lock` | 无请求体 | 主动锁屏，返回 `{accepted,screenInteractive,keyguardLocked}` |
+| `POST /power/wake` | 无请求体 | 请求亮屏，返回 `{accepted,screenInteractive,keyguardLocked}`；不会解除安全锁屏 |
 | `POST /system-action` | `{"action":"HOME"}` | `BACK`、`HOME`、`RECENTS`、`NOTIFICATIONS` |
 | `POST /auth/login` | `{"password":"手机预设密码"}` | 返回会话 `token`，通过 Bearer 使用 |
 | `POST /session/revoke` | Bearer 会话 | 撤销当前会话；不接受 API Key 作为待撤销会话 |
@@ -28,7 +32,7 @@
 
 `/screen` 返回 `X-Screen-Width`、`X-Screen-Height`、`X-Screen-Rotation`（角度）、`X-Screen-Source-Width/Height`、`X-Frame-Sequence`、`X-Frame-Age-Ms` 和 `X-Screen-Revision`。revision 只在尺寸或旋转变化时更新，普通画面刷新保持稳定。JPEG 长边最多 1920 像素，坐标仍按整张 JPEG 归一化，服务端映射到源屏尺寸；不要再手动乘缩放比例。输入可带同一截图的 `screenRevision`，防止旋转或新捕获会话中误触。
 
-`/device` 另提供 `captureState`、`controlReady`、`sourceWidth/sourceHeight`、`displayId`、`frameSequence` 和 `lastError`。捕获失效后不返回旧截图作为成功结果。熄屏、无障碍断开或系统停止共享会关闭端口，需要手机用户恢复授权后重新启动；Key 无需重新生成。
+`/device` 另提供 `captureState`、`controlReady`、`sourceWidth/sourceHeight`、`displayId`、`frameSequence` 和 `lastError`。捕获失效后不返回旧截图作为成功结果。熄屏保留端口和会话，`captureState=screen_off` 且 `controlReady=false`，可以请求 `/power/wake`。亮屏后若录屏授权仍有效则自动恢复新画面；若系统停止共享，则 `captureConsentRequired=true`，需在手机点击“重新授权屏幕共享”，无需重启HTTP服务。无障碍断开仍关闭端口，需要恢复权限并重启；Key 无需重新生成。
 
 ## Python 调用示例
 
@@ -82,8 +86,26 @@ Agent 可直接携带认证头连接 `ws://手机IP:8765/api/v1/stream`。首条
 - `429 TICKET_UNAVAILABLE`：暂缓申请票据；每个服务最多保留 128 张未使用票据。
 - `503 CAPTURE_UNAVAILABLE / ACCESSIBILITY_UNAVAILABLE`：检查手机上的捕获授权、无障碍状态，旋转切换时可稍后重试。
 
-当前服务使用 HTTP，仅在可信网络或 VPN 内使用。受 Android 保护的窗口可能无法截图；普通应用权限不提供任意键码、shell、多指实时事件或剪贴板控制。
+当前服务使用 HTTP，仅在可信网络或 VPN 内使用。受 Android 保护的窗口可能无法截图；普通应用权限不提供任意键码、shell、多指实时事件控制。
 
 ## 可重复 API 检查
 
 服务启动后运行 `python3 scripts/agent-smoke.py --url http://手机IP:8765`，从环境变量读取 `REMOTEAPP_API_KEY`。脚本验证认证、JPEG、源屏几何和错误响应，不发送有效屏幕手势、不修改凭据，也不保存截图。可用 `--report /tmp/remoteapp-report.json` 写入不含凭据的结果。
+
+## 手机剪贴板
+
+网页提供独立文本框及读取/写入按钮，不自动同步，也不依赖浏览器本地剪贴板权限。API 沿用会话/API Key 认证和 `Cache-Control: no-store`。仅处理第一项的文本，不解引用 URI；保留空格、换行及 Unicode，最多 65536 个 UTF-16 单元，超限返回 `413 CLIPBOARD_TOO_LARGE`。写入空字符串可清空文字（仍为一项空文本）；真正无剪贴板内容时读取返回 `{"text":"","hasText":false}`。
+
+Android 10+ 读取要求 RemoteApp 窗口位于手机前台并具有焦点，否则返回 `409 CLIPBOARD_FOREGROUND_REQUIRED`；可先通过最近任务切回 RemoteApp。非文本内容返回 `409 CLIPBOARD_NOT_TEXT`，系统拒绝访问返回 `403 CLIPBOARD_ACCESS_DENIED`。写入通常可在后台进行，厂商限制以系统结果为准。Android 13+ 可能显示系统剪贴板预览并自动清理旧内容。写入成功不等同于已在目标输入框粘贴；仍需操作粘贴并观察结果。
+
+## 锁屏、熄屏和亮屏
+
+`/device` 增加 `screenInteractive`、`keyguardLocked`、`keyguardSecure` 和 `captureConsentRequired`。API Key/会话在熄屏后保留。`POST /power/wake` 必须认证；`accepted=true` 不保证已亮屏或已解锁，应检查返回的 `screenInteractive` 和 `/device`。若始终为false或返回403 WAKE_DENIED，请在手机按电源键；不要无限重试。
+
+熄屏时 `/screen` 和坐标输入返回503，不提供旧图供盲操作。画面流保持连接，发送 `type:state` 消息，captureState为screen_off、starting或unavailable；只有hello/frame携带JPEG几何信息，状态消息后不能继续使用旧图/旧坐标。亮屏恢复后重新观察新图；安全锁屏保护画面可能为黑屏，仍需正常解锁。系统撤销投影后即使亮屏也不能自动恢复授权，应提示手机用户重新允许共享。
+
+### 主动锁屏
+
+`POST /api/v1/power/lock` 沿用密码会话/API Key认证，无需请求体，不要求当前有截图。Android9+使用无障碍GLOBAL_ACTION_LOCK_SCREEN；Android8需先在手机RemoteApp点击“启用锁屏权限（Android 8）”，并在系统界面激活仅含force-lock策略的设备管理权限。未激活返回 `409 LOCK_PERMISSION_REQUIRED`，系统拒绝返回 `409 LOCK_REJECTED` 或 `403 LOCK_DENIED`。`/device`提供 `lockAvailable`、`lockPermissionRequired` 供Agent预判。
+
+锁屏请求成功仍只表示系统接受，应结合/device确认实际状态；HTTP/认证/画面流按熄屏规则保留，系统是否撤销录屏授权依Android版本而定。锁屏不会设置/更改密码。Android8设备管理锁屏后可能要求PIN/密码而暂不能使用指纹。停用旧版锁屏能力或卸载应用前，可在系统设备管理设置中停用RemoteApp管理员；Android9+无需该权限。

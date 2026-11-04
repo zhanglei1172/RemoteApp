@@ -10,6 +10,7 @@ import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.os.PowerManager
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
@@ -36,6 +37,7 @@ class CaptureManager {
     private val lock = Any()
     @Volatile private var latest: CapturedFrame? = null
     @Volatile private var active = false
+    @Volatile private var screenInteractive = true
     private var projection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var reader: ImageReader? = null
@@ -77,13 +79,30 @@ class CaptureManager {
         }
     }
 
-    fun latestFrame(): CapturedFrame? = if (active) latest else null
+    private fun isScreenInteractive(): Boolean {
+        val interactive = context?.getSystemService(PowerManager::class.java)?.isInteractive ?: screenInteractive
+        // Short off/on cycles may complete before SCREEN_OFF is delivered. Invalidate on observation too.
+        setScreenInteractive(interactive)
+        return interactive
+    }
+
+    fun latestFrame(): CapturedFrame? = if (active && isScreenInteractive()) latest else null
     suspend fun capture(): CapturedFrame? = latestFrame()
     fun captureMode(): String = if (active) "media_projection" else "unavailable"
     fun captureState(): String = when {
         !active -> "unavailable"
+        !isScreenInteractive() -> "screen_off"
         latest == null -> "starting"
         else -> "ready"
+    }
+
+    fun hasSession(): Boolean = active
+
+    fun setScreenInteractive(interactive: Boolean) = synchronized(lock) {
+        if (screenInteractive == interactive) return@synchronized
+        screenInteractive = interactive
+        latest = null
+        geometry = geometry?.copy(revision = ++revision)
     }
 
     fun startMediaProjection(
@@ -167,6 +186,7 @@ class CaptureManager {
     }
 
     private fun encode(image: Image) {
+        if (!isScreenInteractive()) return
         val current = geometry ?: return
         val plane = image.planes.firstOrNull() ?: return
         check(plane.pixelStride == 4 && plane.rowStride >= current.width * 4)

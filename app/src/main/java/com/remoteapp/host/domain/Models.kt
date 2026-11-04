@@ -36,6 +36,12 @@ data class DeviceStatus(
     val displayId: Int = 0,
     val frameSequence: Long = 0,
     val lastError: String? = null,
+    val screenInteractive: Boolean = true,
+    val keyguardLocked: Boolean = false,
+    val keyguardSecure: Boolean = false,
+    val captureConsentRequired: Boolean = false,
+    val lockAvailable: Boolean = false,
+    val lockPermissionRequired: Boolean = false,
 )
 
 @Serializable
@@ -92,3 +98,15 @@ data class QualityRequest(
     val fps: Int? = null,
     val jpegQuality: Int? = null
 )
+
+@Serializable
+data class ClipboardRequest(val text: String)
+
+@Serializable
+data class ClipboardResponse(val text: String, val hasText: Boolean)
+
+@Serializable
+data class CaptureStateMessage(val type: String = "state", val captureState: String)
+
+@Serializable
+data class PowerResponse(val accepted: Boolean, val screenInteractive: Boolean, val keyguardLocked: Boolean)

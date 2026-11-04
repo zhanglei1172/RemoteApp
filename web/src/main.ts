@@ -80,17 +80,22 @@ async function api(path: string, init: RequestInit = {}) {
     return new Response(null, { status: 503 });
   }
   if (response.status === 401 && path !== "/api/v1/pairing/claim") showLogin();
-  if (response.status === 409) {
+  if (response.status === 409 && path !== "/api/v1/clipboard") {
     const error = await response.clone().json().catch(() => ({})) as { error?: string };
     document.querySelector("#meta")!.textContent = error.error === "INPUT_BUSY" ? "请等待上一操作完成。" : "操作未完成，请检查画面后重新操作。";
     if (error.error === "SCREEN_CHANGED") screenRevision = undefined;
   }
-  if (response.status === 503) document.querySelector("#meta")!.textContent = "请检查手机的无障碍和屏幕捕获权限。";
+  if (response.status === 503 && path !== "/api/v1/clipboard") document.querySelector("#meta")!.textContent = "请检查手机的无障碍和屏幕捕获权限。";
   return response;
 }
 
 function showLogin() {
   sessionStorage.removeItem(tokenKey);
+  clipboardEpoch++;
+  const clipboardText = document.querySelector<HTMLTextAreaElement>("#clipboardText");
+  if (clipboardText) clipboardText.value = "";
+  const clipboardMessage = document.querySelector("#clipboardMessage");
+  if (clipboardMessage) clipboardMessage.textContent = "";
   invalidateView();
   document.querySelector("#pairing")?.classList.remove("hidden");
   document.querySelector("#console")?.classList.add("hidden");
@@ -122,8 +127,16 @@ function render() {
         </details>
       </section>
       <section id="console" class="card hidden">
-        <div class="toolbar"><button data-action="BACK">返回</button><button data-action="HOME">主页</button><button data-action="RECENTS">最近任务</button><button id="refresh">刷新</button><button id="revoke">撤销会话</button></div>
+        <div class="toolbar"><button data-action="BACK">返回</button><button data-action="HOME">主页</button><button data-action="RECENTS">最近任务</button><button id="wake">唤醒屏幕</button><button id="lock">锁定屏幕</button><button id="refresh">刷新</button><button id="revoke">撤销会话</button></div>
         <canvas id="screen"></canvas><p id="meta"></p>
+        <section class="clipboard" aria-labelledby="clipboardTitle">
+          <h2 id="clipboardTitle">手机剪贴板</h2>
+          <p id="clipboardHelp">读取会替换下方文本；写入会覆盖手机剪贴板，空文本可清空文字。Android 10 及以上读取时，请先将手机上的 RemoteApp 切到前台。</p>
+          <label for="clipboardText">剪贴板文本</label>
+          <textarea id="clipboardText" rows="5" maxlength="65536" autocomplete="off" spellcheck="false" aria-describedby="clipboardHelp"></textarea>
+          <div class="clipboard-actions"><button id="clipboardRead">读取手机剪贴板</button><button id="clipboardWrite">写入手机剪贴板</button></div>
+          <p id="clipboardMessage" role="status" aria-live="polite"></p>
+        </section>
       </section>
     </main>`;
   document.querySelector<HTMLFormElement>("#passwordForm")!.onsubmit = (event) => {
@@ -134,12 +147,76 @@ function render() {
     event.preventDefault();
     void pair();
   };
+  document.querySelector<HTMLButtonElement>("#clipboardRead")!.onclick = () => void transferClipboard(false);
+  document.querySelector<HTMLButtonElement>("#clipboardWrite")!.onclick = () => void transferClipboard(true);
+  document.querySelector<HTMLButtonElement>("#lock")!.onclick = async () => {
+    const button = document.querySelector<HTMLButtonElement>("#lock")!;
+    button.disabled = true;
+    try {
+      const response = await api("/api/v1/power/lock", { method: "POST" });
+      const result = await response.json().catch(() => ({}));
+      document.querySelector("#meta")!.textContent = response.ok ? "锁屏请求已提交，远程连接保留。"
+        : result.error === "LOCK_PERMISSION_REQUIRED" ? "请在手机 RemoteApp 中点击“启用锁屏权限（Android 8）”并在系统中确认。"
+        : "锁屏未完成，请检查手机锁屏权限和无障碍服务。";
+    } finally { button.disabled = false; }
+  };
+  document.querySelector<HTMLButtonElement>("#wake")!.onclick = async () => {
+    const button = document.querySelector<HTMLButtonElement>("#wake")!;
+    button.disabled = true;
+    try {
+      const response = await api("/api/v1/power/wake", { method: "POST" });
+      if (!response.ok) { document.querySelector("#meta")!.textContent = "唤醒失败，请检查手机无障碍服务或在手机上亮屏。"; return; }
+      const result = await response.json();
+      document.querySelector("#meta")!.textContent = !result.screenInteractive ? "系统未允许远程亮屏，请在手机上按电源键。"
+        : result.keyguardLocked ? "屏幕已唤醒；手机仍处于锁屏，请正常解锁。" : "屏幕已唤醒。";
+      if (!screenSocket) await refresh();
+    } finally { button.disabled = false; }
+  };
   document.querySelector<HTMLButtonElement>("#refresh")!.onclick = refresh;
   document.querySelector<HTMLButtonElement>("#revoke")!.onclick = revoke;
   document.querySelectorAll<HTMLButtonElement>("[data-action]").forEach((button) => {
     button.onclick = () => input("/api/v1/system-action", { action: button.dataset.action });
   });
   if (sessionStorage.getItem(tokenKey)) showConsole();
+}
+
+let clipboardBusy = false;
+let clipboardEpoch = 0;
+
+async function transferClipboard(write: boolean) {
+  if (clipboardBusy) return;
+  clipboardBusy = true;
+  const epoch = clipboardEpoch;
+  const text = document.querySelector<HTMLTextAreaElement>("#clipboardText")!;
+  const message = document.querySelector("#clipboardMessage")!;
+  const buttons = document.querySelectorAll<HTMLButtonElement>(".clipboard-actions button");
+  buttons.forEach(button => button.disabled = true);
+  text.disabled = true;
+  message.textContent = write ? "正在写入…" : "正在读取…";
+  try {
+    const response = await api("/api/v1/clipboard", write
+      ? { method: "POST", body: JSON.stringify({ text: text.value }) } : {});
+    const result = await response.json().catch(() => ({}));
+    if (epoch !== clipboardEpoch) return;
+    if (!response.ok) {
+      const errors: Record<string, string> = {
+        CLIPBOARD_FOREGROUND_REQUIRED: "请先将手机上的 RemoteApp 切到前台，再点击读取。",
+        CLIPBOARD_NOT_TEXT: "手机剪贴板中不是文本，无法读取。",
+        CLIPBOARD_TOO_LARGE: "文本过长，最多支持 65536 个 UTF-16 字符单元。",
+        CLIPBOARD_ACCESS_DENIED: "Android 拒绝访问剪贴板，请检查手机权限并将 RemoteApp 切到前台。",
+      };
+      message.textContent = errors[result.error] ?? "操作失败，请检查连接后重试。";
+      return;
+    }
+    if (!write) text.value = result.text;
+    message.textContent = write ? "已写入手机剪贴板。" : result.hasText ? "已读取手机剪贴板。" : "手机剪贴板为空。";
+  } catch {
+    if (epoch === clipboardEpoch) message.textContent = "操作失败，请检查连接后重试。";
+  } finally {
+    clipboardBusy = false;
+    buttons.forEach(button => button.disabled = false);
+    text.disabled = false;
+  }
 }
 
 async function login() {
@@ -207,7 +284,11 @@ async function refresh() {
   if (!sessionStorage.getItem(tokenKey) || document.hidden) return;
   const generation = viewGeneration;
   const response = await api("/api/v1/screen");
-  if (!response.ok || generation !== viewGeneration) return;
+  if (generation !== viewGeneration) return;
+  if (!response.ok) {
+    if (response.status === 503) await stream(generation);
+    return;
+  }
   const revision = Number(response.headers.get("X-Screen-Revision"));
   const blob = await response.blob();
   if (generation !== viewGeneration || !Number.isSafeInteger(revision)) return;
@@ -236,7 +317,23 @@ async function stream(generation: number) {
   socket.onmessage = (event) => {
     if (generation !== viewGeneration || screenSocket !== socket) return;
     if (typeof event.data === "string") {
-      info = JSON.parse(event.data) as FrameInfo;
+      const message = JSON.parse(event.data);
+      if (message.type === "state") {
+        screenRevision = undefined;
+        incomingRevision = undefined;
+        pendingFrame = undefined;
+        info = undefined;
+        const canvas = document.querySelector<HTMLCanvasElement>("#screen")!;
+        canvas.getContext("2d")!.clearRect(0, 0, canvas.width, canvas.height);
+        document.querySelector("#status")!.textContent = "连接保留";
+        document.querySelector("#meta")!.textContent = message.captureState === "screen_off"
+          ? "手机屏幕已关闭，点击“唤醒屏幕”可亮屏；安全锁屏仍需正常解锁。"
+          : message.captureState === "starting" ? "正在等待新画面…"
+          : "连接正常，但系统已停止屏幕共享；请在手机 RemoteApp 中点击“重新授权屏幕共享”。";
+        return;
+      }
+      info = message as FrameInfo;
+      document.querySelector("#meta")!.textContent = "";
       if (incomingRevision !== info.revision) screenRevision = undefined;
       incomingRevision = info.revision;
       return;

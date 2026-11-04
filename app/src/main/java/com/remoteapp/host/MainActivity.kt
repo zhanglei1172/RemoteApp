@@ -1,5 +1,7 @@
 package com.remoteapp.host
 
+import android.app.admin.DevicePolicyManager
+import com.remoteapp.host.platform.ScreenLock
 import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -62,6 +64,8 @@ import com.remoteapp.host.server.RemoteRuntime
 class MainActivity : ComponentActivity() {
     private var accessibilityEnabled by mutableStateOf(false)
     private var addresses by mutableStateOf("")
+    private var lockPermissionRequired by mutableStateOf(false)
+    private var captureConsentRequired by mutableStateOf(false)
     private var hostBusy by mutableStateOf(false)
     private var hostMessage by mutableStateOf<String?>(null)
     private var serverRunning by mutableStateOf(false)
@@ -81,7 +85,17 @@ class MainActivity : ComponentActivity() {
     private val projectionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == RESULT_OK && result.data != null) {
             RemoteRuntime.startWithProjection(this, pendingLanEnabled, result.resultCode, result.data!!)
-        } else RemoteRuntime.updateState(HostPhase.IDLE)
+        } else RemoteRuntime.updateState(if (RemoteRuntime.server != null) HostPhase.RUNNING else HostPhase.IDLE, "屏幕共享未获授权，请重试。")
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        com.remoteapp.host.platform.PhoneClipboard.windowFocused = hasFocus
+    }
+
+    override fun onStop() {
+        com.remoteapp.host.platform.PhoneClipboard.windowFocused = false
+        super.onStop()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -94,6 +108,8 @@ class MainActivity : ComponentActivity() {
                 RemoteAppScreen(
                     accessibilityEnabled = accessibilityEnabled,
                     serverRunning = serverRunning,
+                    captureConsentRequired = captureConsentRequired,
+                    lockPermissionRequired = lockPermissionRequired,
                     hostBusy = hostBusy,
                     hostMessage = hostMessage,
                     addresses = addresses,
@@ -155,12 +171,18 @@ class MainActivity : ComponentActivity() {
                             Toast.makeText(this, "API Key 已复制", Toast.LENGTH_SHORT).show()
                         }
                     },
+                    onGrantLockPermission = {
+                        startActivity(Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply {
+                            putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, ScreenLock.adminComponent(this@MainActivity))
+                            putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "仅用于响应远程锁屏请求，不修改密码、不清除数据。Android 8 锁屏后可能需要输入系统密码。")
+                        })
+                    },
                     onOpenAccessibility = { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) },
                     onLanChanged = { lanEnabled = it },
                     onStart = {
-                        if (isAccessibilityEnabled() && !hostBusy && !serverRunning) {
-                            pairingCode = RemoteRuntime.createPairingCode(this)
-                            pendingLanEnabled = lanEnabled
+                        if (isAccessibilityEnabled() && !hostBusy && (!serverRunning || captureConsentRequired)) {
+                            if (!serverRunning) pairingCode = RemoteRuntime.createPairingCode(this)
+                            pendingLanEnabled = if (serverRunning) RemoteRuntime.lanEnabled else lanEnabled
                             RemoteRuntime.awaitingConsent()
                             try {
                                 projectionLauncher.launch(PlatformCapabilities.captureIntent(this))
@@ -206,9 +228,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun refreshState() {
+        lockPermissionRequired = ScreenLock.permissionRequired(this)
         accessibilityEnabled = isAccessibilityEnabled()
         val state = RemoteRuntime.state.value
-        serverRunning = state.phase == HostPhase.RUNNING
+        serverRunning = RemoteRuntime.running.value
+        captureConsentRequired = !RemoteRuntime.captureManager.hasSession()
         hostBusy = state.busy
         hostMessage = state.message ?: when (state.phase) {
             HostPhase.AWAITING_CONSENT -> "请在系统弹窗中允许整屏共享。"
@@ -239,6 +263,8 @@ class MainActivity : ComponentActivity() {
 private fun RemoteAppScreen(
     accessibilityEnabled: Boolean,
     serverRunning: Boolean,
+    captureConsentRequired: Boolean,
+    lockPermissionRequired: Boolean,
     hostBusy: Boolean,
     hostMessage: String?,
     addresses: String,
@@ -257,6 +283,7 @@ private fun RemoteAppScreen(
     onSetPassword: () -> Unit,
     onGenerateApiKey: () -> Unit,
     onCopyApiKey: () -> Unit,
+    onGrantLockPermission: () -> Unit,
     onOpenAccessibility: () -> Unit,
     onLanChanged: (Boolean) -> Unit,
     onStart: () -> Unit,
@@ -326,7 +353,11 @@ private fun RemoteAppScreen(
             Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("权限状态", style = MaterialTheme.typography.titleSmall)
                 Text(if (accessibilityEnabled) "无障碍服务已连接" else "需要启用或重新连接无障碍服务", style = MaterialTheme.typography.bodySmall)
-                Text("每次启动需要允许整屏录制；锁屏或关闭无障碍会停止控制。侧载应用若无法开启无障碍，请到应用详情允许受限设置。后台被中断时，请检查系统的电池和后台运行设置。", style = MaterialTheme.typography.bodySmall)
+                Text("每次启动需要允许整屏录制；熄屏后保留连接，可从网页唤醒。系统若撤销录屏授权，需重新允许共享；安全锁屏仍需正常解锁，关闭无障碍会停止控制。侧载应用若无法开启无障碍，请到应用详情允许受限设置。后台被中断时，请检查系统的电池和后台运行设置。", style = MaterialTheme.typography.bodySmall)
+                if (lockPermissionRequired) {
+                    Text("Android 8 远程锁屏需要一次设备管理授权，仅申请锁屏能力；锁屏后可能需输入系统密码。可随时在系统设备管理设置中停用。", style = MaterialTheme.typography.bodySmall)
+                    OutlinedButton(onClick = onGrantLockPermission) { Text("启用锁屏权限（Android 8）") }
+                }
                 if (!accessibilityEnabled) {
                     Button(onClick = onOpenAccessibility) { Text("打开系统设置") }
                 }
@@ -355,6 +386,11 @@ private fun RemoteAppScreen(
                 Text("一次性配对码", style = MaterialTheme.typography.titleSmall)
                 Text(it, style = MaterialTheme.typography.headlineSmall)
                 Text("在同一局域网的浏览器打开本机地址并输入此配对码。", style = MaterialTheme.typography.bodySmall)
+            }
+            if (captureConsentRequired) {
+                Button(onClick = onStart, enabled = accessibilityEnabled && !hostBusy, modifier = Modifier.fillMaxWidth()) {
+                    Text(if (hostBusy) "正在恢复屏幕共享…" else "重新授权屏幕共享")
+                }
             }
             OutlinedButton(onClick = onStop, modifier = Modifier.fillMaxWidth()) { Text("停止远程服务") }
         }
