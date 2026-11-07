@@ -8,6 +8,12 @@
 | --- | --- | --- | --- |
 | GET | `/health` | `health` | 无需认证；ok/server/port |
 | GET | `/device` | `device` | 无障碍、捕获方式、画面尺寸/旋转/revision、LAN；新版本含 controlReady、captureState、sourceWidth/Height、displayId、frameSequence、lastError |
+| GET | `/files` | `files` | 传输区列表和额度 |
+| POST | `/files?name=...` | `file-upload --file path` | 原始二进制上传，返回文件ID |
+| GET | `/files/{id}` | `file-download ID --output path` | 流式下载，拒绝覆盖本地文件 |
+| DELETE | `/files/{id}` | `file-remove ID` | 移除传输副本 |
+| POST | `/files/{id}/download-ticket` | `request POST /api/v1/files/ID/download-ticket` | 浏览器单次下载票据 |
+| GET | `/file-download/{ticket}` | 浏览器原生下载 | 单次、30秒有效、绑定文件和原凭据 |
 | GET | `/clipboard` | `request GET /api/v1/clipboard --output file` | `{text,hasText}`；Android10+需RemoteApp前台焦点 |
 | POST | `/clipboard` | `request POST /api/v1/clipboard --json-file file` | `{text}`；上限65536 UTF-16单元，空文本覆盖 |
 | GET | `/screen` | `screen --output path.jpg` | JPEG；保存头信息至 path.jpg.json |
@@ -76,3 +82,5 @@ WS 首条文本为 `type:hello`，含 width/height/rotation/revision/format=jpeg
 `/device`提供lockAvailable和lockPermissionRequired。主动锁屏是明确改变设备状态的动作，应属于用户任务范围；Android8首次需手机用户激活仅force-lock的管理员权限，不能通过API批准。LOCK_REJECTED/LOCK_DENIED表示系统拒绝，不盲目重试。锁屏后按screen_off状态处理，保留连接但不得盲用旧坐标。
 
 隧道自动HTTPS、证书服务名与系统代理的排查方法见 [connection.md](connection.md)。有限帧采样遇到 `type:state` 会立即以 `CAPTURE_NOT_READY` 退出、不保存旧图；Agent先检查device，按screen_off或授权状态处理后再采样。
+
+文件传输契约、大文件命令和手机文件选择流程见 [files.md](files.md)。

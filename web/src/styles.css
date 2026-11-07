@@ -143,3 +143,14 @@ summary { min-height: 44px; padding: 12px 0; cursor: pointer; }
 .clipboard-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
 .clipboard-actions button { flex: 1 1 180px; }
 #clipboardMessage { min-height: 1.5em; margin: 10px 0 0; }
+
+.files { margin-top: 24px; border-top: 1px solid #e0e5ef; padding-top: 20px; }
+.files p { color: #58657d; overflow-wrap: anywhere; }
+.files label { display: block; margin-bottom: 8px; }
+.file-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+.file-actions button { flex: 1 1 120px; }
+#fileProgress { display: block; width: 100%; height: 12px; }
+#fileMessage { min-height: 1.5em; margin: 10px 0; }
+#fileList { list-style: none; padding: 0; margin: 0; }
+#fileList li { border-top: 1px solid #e0e5ef; padding-top: 12px; overflow-wrap: anywhere; }
+#fileList li > span { display: block; }

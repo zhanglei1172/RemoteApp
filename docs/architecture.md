@@ -4,7 +4,7 @@
 
 RemoteApp 面向 Android 8（API 26）及以上：手机用户启用无障碍服务、确认系统整屏录制授权并启动服务后，Agent 或浏览器通过 HTTP/WebSocket 查看 JPEG 画面、执行手势和系统动作。默认仅监听 `127.0.0.1:8765`；用户打开 LAN 后监听 `0.0.0.0:8765`。HTTP 仅适用于可信网络或 VPN。
 
-密码和 API Key 长期保留，但捕获授权按会话申请。锁屏/熄屏保留服务；关闭屏幕时不暴露旧画面、不发送盲触摸。若系统撤销录屏授权，连接保留，需手机用户重新同意共享，不重放旧授权。无障碍断开或进程被杀后不静默恢复控制。受保护的窗口可能黑屏；不提供解锁、任意 shell、文件系统、多指事件接口。
+密码和 API Key 长期保留，但捕获授权按会话申请。锁屏/熄屏保留服务；关闭屏幕时不暴露旧画面、不发送盲触摸。若系统撤销录屏授权，连接保留，需手机用户重新同意共享，不重放旧授权。无障碍断开或进程被杀后不静默恢复控制。受保护的窗口可能黑屏；仅提供传输区文件副本收发，不提供解锁、任意 shell、任意路径文件系统或多指事件接口。
 
 兼容性决策及验收清单见 [android-compatibility.md](android-compatibility.md)，已执行结果见 [testing.md](testing.md)。
 
@@ -94,3 +94,11 @@ App 设置页可滚动、避让安全区和键盘，Key 按钮允许换行；运
 ## 主动锁屏
 
 已认证的POST `/api/v1/power/lock` 在主线程请求系统锁屏，不依赖可用画面。Android9+使用已有无障碍服务的GLOBAL_ACTION_LOCK_SCREEN；Android8仅在用户通过系统ACTION_ADD_DEVICE_ADMIN界面明确激活后使用DevicePolicyManager.lockNow。RemoteDeviceAdminReceiver受BIND_DEVICE_ADMIN保护，仅声明force-lock策略，不申请擦除、修改密码或监控登录等策略。未授权返回409，网页引导在手机启用，不远程批准授权。锁屏保留HTTP/会话；系统若停止投影，仍要求新的本地共享同意。Android8锁屏可能触发强认证，需要系统密码。管理员可由用户在系统设置正常停用，没有阻止停用的逻辑。
+
+## 文件传输区
+
+文件通过SAF（OpenMultipleDocuments/CreateDocument）选择导入及另存，不申请READ/WRITE_EXTERNAL_STORAGE或MANAGE_EXTERNAL_STORAGE。原文件权限只用于复制，不持久化远程可遍历的URI。传输区位于App私有filesDir/transfers，以随机UUID目录保存immutable data及元数据；网络从不接受手机路径。显示名校验长度、路径分隔符和控制字符；下载使用附件及nosniff，不以内联网页执行内容。
+
+认证沿用会话/API Key：GET/POST /api/v1/files、GET/DELETE /files/{id}。上传原始二进制，要求准确的Content-Length（缺失返回411，不支持未知长度的chunked上传），实际收到的长度不符返回400且不提交，64KiB缓冲、在IO线程处理，限制100MiB单文件、512MiB总量、256个文件以及2个未完成上传；提交时同文件系统目录重命名，失败/取消清理临时目录，启动清理遗留pending。并发额度计入未完成写入，检查磁盘余量；同名文件不覆盖。下载最多2路、流式输出，周期检查原凭据有效性；文件传输不依赖当前画面或屏幕亮起。
+
+网页使用已认证POST /files/{id}/download-ticket取得30秒单次票据，绑定文件ID与原凭据，最多128张；GET /file-download/{ticket}用于浏览器原生下载，避免移动端大Blob内存和永久凭据URL泄露。响应no-store/no-referrer；票据失效/消费后需重新申请。Agent直接带认证头GET文件。所有副本对持有手机控制凭据的客户端共享，删除只作用于副本，不删除手机源文件或已导出的文件。

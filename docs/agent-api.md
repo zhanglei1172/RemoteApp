@@ -109,3 +109,9 @@ Android 10+ 读取要求 RemoteApp 窗口位于手机前台并具有焦点，否
 `POST /api/v1/power/lock` 沿用密码会话/API Key认证，无需请求体，不要求当前有截图。Android9+使用无障碍GLOBAL_ACTION_LOCK_SCREEN；Android8需先在手机RemoteApp点击“启用锁屏权限（Android 8）”，并在系统界面激活仅含force-lock策略的设备管理权限。未激活返回 `409 LOCK_PERMISSION_REQUIRED`，系统拒绝返回 `409 LOCK_REJECTED` 或 `403 LOCK_DENIED`。`/device`提供 `lockAvailable`、`lockPermissionRequired` 供Agent预判。
 
 锁屏请求成功仍只表示系统接受，应结合/device确认实际状态；HTTP/认证/画面流按熄屏规则保留，系统是否撤销录屏授权依Android版本而定。锁屏不会设置/更改密码。Android8设备管理锁屏后可能要求PIN/密码而暂不能使用指纹。停用旧版锁屏能力或卸载应用前，可在系统设备管理设置中停用RemoteApp管理员；Android9+无需该权限。
+
+## 文件双向传输
+
+`GET /api/v1/files`列出传输副本和额度；`POST /api/v1/files?name=URL编码文件名`以原始二进制上传，返回201及`id/name/size/createdAt`；`GET /api/v1/files/{id}`下载，`DELETE`移除副本。全部沿用现有认证。手机文件需先在App“从手机选择文件”中导入，收到的副本可“保存到手机”另存；不存在任意手机路径接口。
+
+单文件100MiB、总量512MiB、256个文件，2路上传/2路下载；失败上传清理，下载端应校验Content-Length并清理半成品。网页用`POST /files/{id}/download-ticket`换取绑定文件/凭据的30秒单次票据，原生下载`GET /file-download/{ticket}`。上传必须提供准确的Content-Length；缺少返回411 LENGTH_REQUIRED，长度无效或截断返回400 INVALID_FILE_LENGTH/INCOMPLETE_UPLOAD，不发布副本。错误另含400 INVALID_FILENAME、404 FILE_NOT_FOUND、413 FILE_TOO_LARGE、429 TRANSFER_BUSY、507 TRANSFER_LIMIT/STORAGE_FULL/STORAGE_UNAVAILABLE。Skill专用命令流式处理大文件，详见[文件传输](../skills/remoteapp-control/references/files.md)。

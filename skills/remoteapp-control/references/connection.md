@@ -40,3 +40,9 @@ python3 <skill-dir>/scripts/remoteapp.py --url https://phone.example:21797 --ask
 ```
 
 上述示例可组合证书/代理参数，均放在子命令前。`--ask-key` 无 TTY 时直接拒绝，避免回退到明文回显。临时认证材料用后清理；用户要求查看的截图及元数据可保留在权限受限的任务目录，实际查看图片后向用户展示或提供文件链接。
+
+## Cloudflare 请求头与默认端口
+
+若无认证 health 返回403且正文为`error code: 1010`，这是Cloudflare边缘拒绝，不能据此判断Key失效。客户端HTTP和WSS统一发送真实的`User-Agent: RemoteAppControl/1.0`；旧脚本使用Python默认标识时曾被拒绝，更新客户端后正常。不要关闭TLS验证、伪造浏览器指纹或自动重放写操作；新客户端仍遭拒绝时需检查服务端规则。
+
+`https://host`省略端口时，HTTP和WSS均使用443；`http://host`使用80。无需为了画面流改成另一地址或端口。截图后若立即操作只看到旧画面，可短暂等待再取图核对；MIUI安全键盘等受保护窗口可能暂时显示黑色，不能把接口completed等同于可见业务结果。

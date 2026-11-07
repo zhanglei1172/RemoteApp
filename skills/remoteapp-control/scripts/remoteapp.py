@@ -13,6 +13,7 @@ import secrets
 import socket
 import ssl
 import struct
+import tempfile
 import sys
 import urllib.error
 import urllib.parse
@@ -130,35 +131,97 @@ class Client:
         headers = {"Content-Type": "application/json", **self.headers(auth)}
         data = json.dumps(body, allow_nan=False).encode() if body is not None else None
         request = urllib.request.Request(self.url + path, data=data, method=method, headers=headers)
-        try:
-            response = self.opener.open(request, timeout=self.timeout)
-        except urllib.error.HTTPError as error:
-            response = error
-        except urllib.error.URLError as error:
-            if isinstance(error.reason, ssl.SSLCertVerificationError):
-                raise ClientError("TLS_CERTIFICATE_INVALID: check the tunnel certificate, --ca-file and --tls-server-name; no credentials were sent over TLS") from None
-            raise ClientError("CONNECTION_FAILED: check the supplied address, tunnel and proxy; --no-proxy bypasses HTTP system proxies") from None
+        response = self.open_request(request)
         with response:
             payload = response.read(MAX_MESSAGE + 1)
             if len(payload) > MAX_MESSAGE:
                 raise ClientError("Response exceeds the capture size limit")
-            if not 200 <= response.code < 300:
-                if response.code == 501 and "自动 HTTPS" in payload.decode("utf-8", errors="replace"):
-                    raise ClientError("HTTPS_REQUIRED: this tunnel enables automatic HTTPS; check health using https:// on the same host and port before authentication")
-                try:
-                    detail = redact(json.loads(payload))
-                except (ValueError, UnicodeError):
-                    detail = {"error": "NON_JSON_ERROR"}
-                message = json.dumps({"status": response.code, "detail": detail}, ensure_ascii=False)
-                for secret in (self.key, self.token, *(body.get(field, "") for field in ("password", "code") if isinstance(body, dict))):
-                    if isinstance(secret, str) and secret:
-                        message = message.replace(secret, "[redacted]")
-                raise ClientError(message)
+            self.check_response(response, payload, body)
             return response.headers, payload
+
+    def open_request(self, request):
+        request.add_header("User-Agent", "RemoteAppControl/1.0")
+        try:
+            return self.opener.open(request, timeout=self.timeout)
+        except urllib.error.HTTPError as error:
+            return error
+        except urllib.error.URLError as error:
+            if isinstance(error.reason, ssl.SSLCertVerificationError):
+                raise ClientError("TLS_CERTIFICATE_INVALID: check the tunnel certificate, --ca-file and --tls-server-name; no credentials were sent over TLS") from None
+            raise ClientError("CONNECTION_FAILED: check the supplied address, tunnel and proxy; --no-proxy bypasses HTTP system proxies") from None
+
+    def check_response(self, response, payload, body=None):
+        if not 200 <= response.code < 300:
+            if response.code == 501 and "自动 HTTPS" in payload.decode("utf-8", errors="replace"):
+                raise ClientError("HTTPS_REQUIRED: this tunnel enables automatic HTTPS; check health using https:// on the same host and port before authentication")
+            try:
+                detail = redact(json.loads(payload))
+            except (ValueError, UnicodeError):
+                detail = {"error": "NON_JSON_ERROR"}
+            message = json.dumps({"status": response.code, "detail": detail}, ensure_ascii=False)
+            for secret in (self.key, self.token, *(body.get(field, "") for field in ("password", "code") if isinstance(body, dict))):
+                if isinstance(secret, str) and secret:
+                    message = message.replace(secret, "[redacted]")
+            raise ClientError(message)
 
     def json(self, method, path, body=None, auth="auto"):
         _, payload = self.request(method, path, body, auth)
         return json.loads(payload)
+
+
+
+def upload_file(client, path, name=None):
+    path = Path(path).expanduser()
+    with path.open("rb") as source:
+        size = os.fstat(source.fileno()).st_size
+        if size > 100 * 1024 * 1024:
+            raise ClientError("FILE_TOO_LARGE: maximum file size is 100 MiB")
+        filename = name or path.name
+        request = urllib.request.Request(client.url + "/api/v1/files?name=" + urllib.parse.quote(filename, safe=""),
+            method="POST", data=source,
+            headers={**client.headers(), "Content-Type": "application/octet-stream", "Content-Length": str(size)})
+        with client.open_request(request) as response:
+            payload = response.read(MAX_MESSAGE + 1)
+            if len(payload) > MAX_MESSAGE:
+                raise ClientError("Response exceeds metadata limit")
+            client.check_response(response, payload)
+            return json.loads(payload)
+
+
+def download_file(client, file_id, destination):
+    path = Path(destination).expanduser()
+    if path.exists():
+        raise ClientError("Output already exists; choose a different destination")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    request = urllib.request.Request(client.url + "/api/v1/files/" + urllib.parse.quote(file_id, safe=""), headers=client.headers())
+    temporary = None
+    try:
+        with client.open_request(request) as response:
+            if not 200 <= response.code < 300:
+                client.check_response(response, response.read(MAX_MESSAGE))
+            expected = response.headers.get("Content-Length")
+            expected = int(expected) if expected is not None else None
+            if expected is not None and not 0 <= expected <= 100 * 1024 * 1024:
+                raise ClientError("Invalid file length or file exceeds 100 MiB")
+            fd, temporary = tempfile.mkstemp(prefix=".remoteapp-download-", dir=path.parent)
+            count = 0
+            with os.fdopen(fd, "wb") as output:
+                while True:
+                    block = response.read(64 * 1024)
+                    if not block:
+                        break
+                    count += len(block)
+                    if count > 100 * 1024 * 1024:
+                        raise ClientError("File exceeds 100 MiB")
+                    output.write(block)
+            if expected is not None and count != expected:
+                raise ClientError("Download interrupted; partial file removed")
+        # Atomic publication without overwriting an existing destination, even under a race.
+        os.link(temporary, path)
+        return {"output": str(path.resolve()), "bytes": count}
+    finally:
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
 
 
 def read_exact(connection, count):
@@ -215,13 +278,13 @@ def read_message(connection):
 
 def capture_stream(client, output_dir, frames=3, fps=5, ticket=""):
     origin = urllib.parse.urlsplit(client.url)
-    connection = socket.create_connection((origin.hostname, origin.port), timeout=client.timeout)
+    connection = socket.create_connection((origin.hostname, origin.port or (443 if origin.scheme == "https" else 80)), timeout=client.timeout)
     try:
         if origin.scheme == "https":
             connection = client.tls_context.wrap_socket(connection, server_hostname=client.tls_server_name or origin.hostname)
         nonce = base64.b64encode(secrets.token_bytes(16)).decode()
         path = "/api/v1/stream" + ("?ticket=" + urllib.parse.quote(ticket, safe="") if ticket else "")
-        headers = {"Host": origin.netloc, "Upgrade": "websocket", "Connection": "Upgrade",
+        headers = {"Host": origin.netloc, "Upgrade": "websocket", "Connection": "Upgrade", "User-Agent": "RemoteAppControl/1.0",
                    "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": nonce,
                    **({} if ticket else client.headers())}
         connection.sendall((f"GET {path} HTTP/1.1\r\n" + "".join(f"{key}: {value}\r\n" for key, value in headers.items()) + "\r\n").encode())
@@ -302,7 +365,7 @@ def parser():
     root.add_argument("--tls-server-name", help="Configured TLS service hostname for SNI and certificate verification; routing address stays unchanged")
     root.add_argument("--no-proxy", action="store_true", help="Bypass system proxies for HTTP(S); WebSocket connections are already direct")
     sub = root.add_subparsers(dest="command", required=True)
-    for command in ("health", "device", "revoke-session", "revoke-all"):
+    for command in ("health", "device", "files", "revoke-session", "revoke-all"):
         sub.add_parser(command)
     for command in ("login", "pair"):
         p = sub.add_parser(command)
@@ -329,8 +392,16 @@ def parser():
             p.add_argument("--duration-ms", type=int, default=450)
     p = sub.add_parser("action")
     p.add_argument("action", choices=["BACK", "HOME", "RECENTS", "NOTIFICATIONS"])
+    p = sub.add_parser("file-upload", help="Stream a local file into the phone transfer area")
+    p.add_argument("--file", required=True)
+    p.add_argument("--name", help="Optional phone-side display name")
+    p = sub.add_parser("file-download", help="Stream a transfer file to a new private local file")
+    p.add_argument("id")
+    p.add_argument("--output", required=True)
+    p = sub.add_parser("file-remove", help="Remove only a phone transfer copy")
+    p.add_argument("id")
     p = sub.add_parser("request", help="Call another existing /api/v1 endpoint; no retries")
-    p.add_argument("method", choices=["GET", "POST"])
+    p.add_argument("method", choices=["GET", "POST", "DELETE"])
     p.add_argument("path")
     p.add_argument("--json-file")
     p.add_argument("--output", help="Save raw response privately instead of printing redacted JSON")
@@ -351,7 +422,7 @@ def run(args):
                     secret_value(args.token_file, "REMOTEAPP_SESSION_TOKEN"), args.timeout,
                     ca_file=args.ca_file, no_proxy=args.no_proxy, tls_server_name=args.tls_server_name)
     command = args.command
-    if command in ("health", "device"):
+    if command in ("health", "device", "files"):
         return client.json("GET", "/api/v1/" + command, auth="none" if command == "health" else "auto")
     if command in ("login", "pair"):
         value = secret_value(args.password_file, "REMOTEAPP_PASSWORD", header=False) if command == "login" else secret_value(args.code_file, "REMOTEAPP_PAIRING_CODE")
@@ -360,6 +431,12 @@ def run(args):
         data = client.json("POST", "/api/v1/auth/login" if command == "login" else "/api/v1/pairing/claim",
                            {"password" if command == "login" else "code": value}, auth="none")
         return {"authenticated": True, "sessionFile": private_write(args.save_session, data["token"])}
+    if command == "file-upload":
+        return upload_file(client, args.file, args.name)
+    if command == "file-download":
+        return download_file(client, args.id, args.output)
+    if command == "file-remove":
+        return client.json("DELETE", "/api/v1/files/" + urllib.parse.quote(args.id, safe=""))
     if command == "screen":
         headers, payload = client.request("GET", "/api/v1/screen")
         if not payload.startswith(b"\xff\xd8"):

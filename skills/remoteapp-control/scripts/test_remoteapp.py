@@ -43,6 +43,10 @@ class ClientTests(unittest.TestCase):
             def log_message(self, *_):
                 pass
             def do_GET(self):
+                if self.headers.get("User-Agent") != "RemoteAppControl/1.0":
+                    self.send_response(403)
+                    self.end_headers()
+                    return
                 calls.append((self.path, self.headers.get("X-API-Key"), self.headers.get("Authorization")))
                 if self.path.endswith("redirect"):
                     self.send_response(302)
@@ -155,6 +159,10 @@ class ClientTests(unittest.TestCase):
                 pass
             def do_GET(self):
                 requests.append((self.path, self.headers.get("X-API-Key")))
+                if self.headers.get("User-Agent") != "RemoteAppControl/1.0":
+                    self.send_response(403)
+                    self.end_headers()
+                    return
                 if self.path.endswith("stream"):
                     nonce = self.headers["Sec-WebSocket-Key"]
                     accept = base64.b64encode(hashlib.sha1((nonce + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
@@ -195,12 +203,85 @@ class ClientTests(unittest.TestCase):
                 self.assertTrue(client.json("GET", "/api/v1/device")["ok"])
                 result = remoteapp.capture_stream(client, str(folder / "frames"), frames=1)
                 self.assertEqual(result["metadata"]["revision"], 19)
-                self.assertEqual(requests, [("/api/v1/device", "test-key"), ("/api/v1/stream", "test-key")])
+                # Route the standard HTTPS port to our local TLS fixture while preserving
+                # actual TLS verification, HTTP Host and WebSocket handshaking.
+                connect = socket.create_connection
+                def route_default_https(address, **kwargs):
+                    self.assertEqual(address, ("127.0.0.1", 443))
+                    return connect(("127.0.0.1", server.server_port), **kwargs)
+                default_port_client = remoteapp.Client("https://127.0.0.1", "test-key",
+                    ca_file=cert, tls_server_name="phone.example.test", no_proxy=True)
+                with mock.patch("remoteapp.socket.create_connection", side_effect=route_default_https):
+                    result = remoteapp.capture_stream(default_port_client, str(folder / "default-port"), frames=1)
+                self.assertEqual(result["metadata"]["revision"], 19)
+                self.assertEqual(requests, [("/api/v1/device", "test-key"), ("/api/v1/stream", "test-key"), ("/api/v1/stream", "test-key")])
                 with self.assertRaisesRegex(remoteapp.ClientError, "https://"):
                     remoteapp.Client("http://127.0.0.1:1234", ca_file=cert)
             finally:
                 server.shutdown()
                 server.server_close()
+
+    def test_large_binary_file_roundtrip_and_incomplete_download_cleanup(self):
+        digest = hashlib.sha256()
+        size = 20 * 1024 * 1024 + 123
+        received = []
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+            def do_POST(self):
+                remaining = int(self.headers["Content-Length"])
+                received.append((self.path, remaining, self.headers.get("X-API-Key")))
+                while remaining:
+                    block = self.rfile.read(min(64 * 1024, remaining))
+                    if not block:
+                        break
+                    digest.update(block)
+                    remaining -= len(block)
+                self.send_response(201)
+                self.end_headers()
+                self.wfile.write(b'{"id":"file-id"}')
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(size))
+                self.end_headers()
+                if self.path.endswith("interrupted"):
+                    self.wfile.write(b"partial")
+                    return
+                remaining = size
+                while remaining:
+                    chunk = b"x" * min(64 * 1024, remaining)
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            client = remoteapp.Client(f"127.0.0.1:{server.server_port}", "test-key", no_proxy=True)
+            with tempfile.TemporaryDirectory() as temp:
+                folder = Path(temp)
+                source = folder / "source.bin"
+                with source.open("wb") as output:
+                    remaining = size
+                    while remaining:
+                        chunk = b"x" * min(64 * 1024, remaining)
+                        output.write(chunk)
+                        remaining -= len(chunk)
+                self.assertEqual(remoteapp.upload_file(client, source, "中文 +.bin")["id"], "file-id")
+                self.assertIn("%E4%B8%AD%E6%96%87%20%2B.bin", received[0][0])
+                self.assertEqual(received[0][1:], (size, "test-key"))
+                result = remoteapp.download_file(client, "file-id", folder / "download.bin")
+                self.assertEqual(result["bytes"], size)
+                with (folder / "download.bin").open("rb") as data:
+                    self.assertEqual(hashlib.file_digest(data, "sha256").digest(), digest.digest())
+                self.assertEqual(os.stat(folder / "download.bin").st_mode & 0o777, 0o600)
+                with self.assertRaisesRegex(remoteapp.ClientError, "already exists"):
+                    remoteapp.download_file(client, "file-id", folder / "download.bin")
+                with self.assertRaisesRegex(remoteapp.ClientError, "interrupted"):
+                    remoteapp.download_file(client, "interrupted", folder / "partial.bin")
+                self.assertFalse((folder / "partial.bin").exists())
+                self.assertFalse(any(path.name.startswith(".remoteapp-download-") for path in folder.iterdir()))
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_paused_stream_fails_promptly_without_saving_stale_pixels(self):
         connection, peer = socket.socketpair()

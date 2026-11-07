@@ -65,3 +65,9 @@ Skill 支持密码/配对会话、截图和画面流、点按/长按/滑动、�
 ### 远程亮屏与锁屏
 
 网页工具栏提供“唤醒屏幕”和“锁定屏幕”，Agent也可调用 `POST /api/v1/power/wake`、`POST /api/v1/power/lock`。Android9+锁屏使用无障碍服务；Android8需在App中启用一次锁屏权限并完成系统确认。亮屏不会解除安全锁屏，系统撤销的录屏授权需在手机重新同意。
+
+### 文件互传
+
+网页“文件互传”可多选上传、查看进度、取消、下载和移除传输副本。手机在App“文件互传”中选择原文件供远程下载，或将收到的副本“保存到手机”的所选位置。使用系统文件选择器，支持Android8+，无需全盘存储权限。单文件100MiB，总计512MiB、256个副本；传输区随卸载/清除数据删除，重要文件请另存。
+
+Agent使用Skill的 `files`、`file-upload --file 本地路径`、`file-download 文件ID --output 本地路径`，详见 [文件传输指南](skills/remoteapp-control/references/files.md)。

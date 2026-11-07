@@ -2,6 +2,11 @@ package com.remoteapp.host
 
 import android.app.admin.DevicePolicyManager
 import com.remoteapp.host.platform.ScreenLock
+import com.remoteapp.host.transfer.PhoneTransfers
+import com.remoteapp.host.transfer.TransferPanel
+import android.provider.OpenableColumns
+import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.coroutineContext
 import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -80,6 +85,62 @@ class MainActivity : ComponentActivity() {
     private var savingPassword by mutableStateOf(false)
     private var generatingApiKey by mutableStateOf(false)
 
+    private var transferBusy by mutableStateOf(false)
+    private var transferMessage by mutableStateOf<String?>(null)
+    private var pendingExportId: String? = null
+    private val importFiles = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isNotEmpty()) lifecycleScope.launch {
+            transferBusy = true
+            var imported = 0
+            try {
+                withContext(Dispatchers.IO) {
+                    val store = PhoneTransfers.store(this@MainActivity)
+                    for (uri in uris) {
+                        coroutineContext.ensureActive()
+                        try {
+                            val name = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+                                if (it.moveToFirst()) it.getString(0) else null
+                            } ?: "file"
+                            contentResolver.openInputStream(uri)?.use { input ->
+                                val job = coroutineContext
+                                store.import(name, input) { job.ensureActive() }
+                                imported++
+                            }
+                        } catch (error: kotlinx.coroutines.CancellationException) { throw error }
+                        catch (_: Exception) { /* Continue independent selections; report counts below. */ }
+                    }
+                }
+                transferMessage = "已放入传输区 $imported 个文件" + if (imported < uris.size) "，${uris.size - imported} 个失败（请检查大小、权限或空间）。" else "，可从网页下载。"
+            } finally { transferBusy = false }
+        }
+    }
+    private val exportFile = registerForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+        val id = pendingExportId
+        pendingExportId = null
+        if (uri != null && id != null) lifecycleScope.launch {
+            transferBusy = true
+            try {
+                withContext(Dispatchers.IO) {
+                    PhoneTransfers.store(this@MainActivity).open(id).use { input ->
+                        val output = contentResolver.openOutputStream(uri) ?: error("No output stream")
+                        output.use {
+                            val buffer = ByteArray(64 * 1024)
+                            while (true) {
+                                coroutineContext.ensureActive()
+                                val count = input.read(buffer)
+                                if (count == -1) break
+                                it.write(buffer, 0, count)
+                            }
+                        }
+                    }
+                }
+                transferMessage = "已保存到所选位置。"
+            } catch (error: kotlinx.coroutines.CancellationException) { throw error }
+            catch (_: Exception) { transferMessage = "保存失败，请检查文件是否仍在、目标权限和剩余空间。" }
+            finally { transferBusy = false }
+        }
+    }
+
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
     private var pendingLanEnabled = false
     private val projectionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -100,12 +161,19 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pendingExportId = savedInstanceState?.getString("exportId")
         pendingLanEnabled = savedInstanceState?.getBoolean("pendingLan") ?: false
         lanEnabled = savedInstanceState?.getBoolean("lan") ?: false
         requestNotificationPermissionIfNeeded()
         setContent {
             MaterialTheme {
                 RemoteAppScreen(
+                    transferPanel = {
+                        TransferPanel(transferBusy, transferMessage,
+                            onImport = { importFiles.launch(arrayOf("*/*")) },
+                            onExport = { file -> pendingExportId = file.id; exportFile.launch(file.name) },
+                        )
+                    },
                     accessibilityEnabled = accessibilityEnabled,
                     serverRunning = serverRunning,
                     captureConsentRequired = captureConsentRequired,
@@ -217,6 +285,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString("exportId", pendingExportId)
         outState.putBoolean("pendingLan", pendingLanEnabled)
         outState.putBoolean("lan", lanEnabled)
         super.onSaveInstanceState(outState)
@@ -261,6 +330,7 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalLayoutApi::class)
 @androidx.compose.runtime.Composable
 private fun RemoteAppScreen(
+    transferPanel: @androidx.compose.runtime.Composable () -> Unit,
     accessibilityEnabled: Boolean,
     serverRunning: Boolean,
     captureConsentRequired: Boolean,
@@ -363,6 +433,8 @@ private fun RemoteAppScreen(
                 }
             }
         }
+
+        transferPanel()
 
         hostMessage?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
 

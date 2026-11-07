@@ -10,6 +10,17 @@ import com.remoteapp.host.platform.ScreenLockResult
 import com.remoteapp.host.domain.CaptureStateMessage
 import android.content.Context
 import android.os.Build
+import com.remoteapp.host.transfer.PhoneTransfers
+import com.remoteapp.host.transfer.TransferException
+import com.remoteapp.host.transfer.DownloadTickets
+import io.ktor.server.request.receiveChannel
+import io.ktor.server.routing.delete
+import io.ktor.server.response.respondOutputStream
+import io.ktor.utils.io.readAvailable
+import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.coroutineContext
+import java.io.IOException
+import java.net.URLEncoder
 import com.remoteapp.host.accessibility.GestureResult
 import com.remoteapp.host.accessibility.RemoteAccessibilityService
 import com.remoteapp.host.capture.CaptureManager
@@ -77,6 +88,9 @@ class HttpServer(
     private var engine: EmbeddedServer<*, *>? = null
     private var bindLan: Boolean = false
     private val streamSlots = Semaphore(4)
+    private val downloadSlots = Semaphore(2)
+    private val downloadTickets = DownloadTickets()
+    private val transfers by lazy { PhoneTransfers.store(context) }
 
     fun start(allowLan: Boolean) {
         if (engine != null) return
@@ -94,6 +108,18 @@ class HttpServer(
     private fun Application.configureRoutes() {
         install(ContentNegotiation) { json(codec) }
         install(StatusPages) {
+            exception<TransferException> { call, error ->
+                val status = when (error.code) {
+                    "TRANSFER_UNAUTHORIZED" -> HttpStatusCode.Unauthorized
+                    "FILE_NOT_FOUND" -> HttpStatusCode.NotFound
+                    "INVALID_FILENAME", "INCOMPLETE_UPLOAD", "INVALID_FILE_LENGTH" -> HttpStatusCode.BadRequest
+                    "LENGTH_REQUIRED" -> HttpStatusCode.LengthRequired
+                    "FILE_TOO_LARGE" -> HttpStatusCode.PayloadTooLarge
+                    "TRANSFER_BUSY" -> HttpStatusCode.TooManyRequests
+                    else -> HttpStatusCode.InsufficientStorage
+                }
+                call.respondError(status, error.code, "File transfer could not be completed: ${error.code}")
+            }
             exception<BadRequestException> { call, _ ->
                 call.respondError(HttpStatusCode.BadRequest, "INVALID_REQUEST", "Request body must be valid JSON matching the API schema")
             }
@@ -122,6 +148,61 @@ class HttpServer(
 
             get("/api/v1/health") {
                 call.respond(HealthResponse(ok = true, server = "remoteapp", port = port))
+            }
+            get("/api/v1/files") {
+                if (!call.authorized()) return@get
+                call.respond(withContext(Dispatchers.IO) { transfers.list() })
+            }
+            post("/api/v1/files") {
+                if (!call.authorized()) return@post
+                val credential = call.credential() ?: return@post
+                val name = call.request.queryParameters["name"] ?: throw TransferException("INVALID_FILENAME")
+                val declaredLength = call.request.headers[HttpHeaders.ContentLength] ?: throw TransferException("LENGTH_REQUIRED")
+                val length = declaredLength.toLongOrNull()?.takeIf { it >= 0 } ?: throw TransferException("INVALID_FILE_LENGTH")
+                if (length > transfers.maxFileBytes) throw TransferException("FILE_TOO_LARGE")
+                val file = withContext(Dispatchers.IO) {
+                    val item = transfers.begin(name)
+                    try {
+                        val channel = call.receiveChannel()
+                        val buffer = ByteArray(64 * 1024)
+                        while (true) {
+                            coroutineContext.ensureActive()
+                            if (!RemoteRuntime.pairingManager.isValid(credential)) throw TransferException("TRANSFER_UNAUTHORIZED")
+                            val count = channel.readAvailable(buffer, 0, buffer.size)
+                            if (count == -1) break
+                            if (count > 0) transfers.append(item, buffer, count)
+                        }
+                        if (!RemoteRuntime.pairingManager.isValid(credential)) throw TransferException("TRANSFER_UNAUTHORIZED")
+                        transfers.commit(item, expectedLength = length)
+                    } catch (error: IOException) {
+                        throw TransferException("STORAGE_UNAVAILABLE")
+                    } finally { transfers.abort(item) }
+                }
+                call.respond(HttpStatusCode.Created, file)
+            }
+            get("/api/v1/files/{id}") {
+                if (!call.authorized()) return@get
+                call.sendTransfer(call.parameters["id"].orEmpty(), call.credential() ?: return@get)
+            }
+            delete("/api/v1/files/{id}") {
+                if (!call.authorized()) return@delete
+                withContext(Dispatchers.IO) { transfers.remove(call.parameters["id"].orEmpty()) }
+                call.respond(mapOf("removed" to true))
+            }
+            post("/api/v1/files/{id}/download-ticket") {
+                if (!call.authorized()) return@post
+                val id = call.parameters["id"].orEmpty()
+                withContext(Dispatchers.IO) { transfers.entry(id) }
+                call.respond(com.remoteapp.host.domain.StreamTicketResponse(downloadTickets.issue(id, call.credential() ?: return@post)))
+            }
+            get("/api/v1/file-download/{ticket}") {
+                val grant = downloadTickets.consume(call.parameters["ticket"].orEmpty())
+                if (grant == null || !RemoteRuntime.pairingManager.isValid(grant.credential)) {
+                    call.respondError(HttpStatusCode.Unauthorized, "UNAUTHORIZED", "Download ticket is invalid or expired")
+                    return@get
+                }
+                call.response.headers.append("Referrer-Policy", "no-referrer")
+                call.sendTransfer(grant.fileId, grant.credential)
             }
             get("/api/v1/device") {
                 if (!call.authorized()) return@get
@@ -352,6 +433,31 @@ class HttpServer(
                 } finally { streamSlots.release() }
             }
         }
+    }
+
+    private suspend fun io.ktor.server.application.ApplicationCall.sendTransfer(id: String, credential: Credential) {
+        if (!downloadSlots.tryAcquire()) throw TransferException("TRANSFER_BUSY")
+        try {
+            val entry = withContext(Dispatchers.IO) { transfers.entry(id) }
+            val input = withContext(Dispatchers.IO) { transfers.open(id) }
+            input.use {
+                val encodedName = URLEncoder.encode(entry.name, "UTF-8").replace("+", "%20")
+                response.headers.append(HttpHeaders.ContentDisposition, "attachment; filename=\"download\"; filename*=UTF-8''$encodedName")
+                response.headers.append("X-Content-Type-Options", "nosniff")
+                respondOutputStream(ContentType.Application.OctetStream, contentLength = entry.size) {
+                    withContext(Dispatchers.IO) {
+                        val buffer = ByteArray(64 * 1024)
+                        while (true) {
+                            coroutineContext.ensureActive()
+                            if (!RemoteRuntime.pairingManager.isValid(credential)) throw IOException("Transfer credential revoked")
+                            val count = input.read(buffer)
+                            if (count == -1) break
+                            write(buffer, 0, count)
+                        }
+                    }
+                }
+            }
+        } finally { downloadSlots.release() }
     }
 
     private suspend fun io.ktor.server.application.ApplicationCall.authorized(): Boolean {
