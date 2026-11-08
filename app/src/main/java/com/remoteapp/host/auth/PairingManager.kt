@@ -32,8 +32,8 @@ class PairingManager internal constructor(
     private val tickets = ConcurrentHashMap<String, Pair<Credential, Long>>()
     @Volatile private var pairingCode: String? = null
     @Volatile private var pairingExpiresAt = 0L
-    private var failedLogins = 0
-    private var nextLoginAllowedAt = 0L
+    private val passwordThrottle = AuthThrottle(prefs, "password_attempt", now)
+    private val pairingThrottle = AuthThrottle(prefs, "pairing_attempt", now)
 
     @Synchronized
     fun createPairingCode(): String {
@@ -59,38 +59,37 @@ class PairingManager internal constructor(
         if (!saved) return false
         activeTokens.clear()
         tickets.clear()
-        failedLogins = 0
-        nextLoginAllowedAt = 0L
+        passwordThrottle.clear()
         return true
     }
 
+    fun login(password: String): String? = attemptLogin(password).token
+
     @Synchronized
-    fun login(password: String): String? {
-        val time = now()
-        if (!isPasswordConfigured() || time < nextLoginAllowedAt) return null
-        if (!isValidPassword(password)) return loginFailed()
+    internal fun attemptLogin(password: String): AuthenticationResult {
+        val remaining = passwordThrottle.remainingSeconds()
+        if (remaining > 0) return AuthenticationResult(retryAfterSeconds = remaining, rateLimited = true)
+        if (!isPasswordConfigured()) return AuthenticationResult()
+        if (!verifyPassword(password)) return passwordThrottle.failed()
+        passwordThrottle.clear()
+        return AuthenticationResult(token = createToken())
+    }
+
+    private fun verifyPassword(password: String): Boolean {
+        if (!isValidPassword(password)) return false
         val salt = prefs.getString(KEY_PASSWORD_SALT, null)?.let {
             runCatching { Base64.getDecoder().decode(it) }.getOrNull()
-        } ?: return null
-        val expected = prefs.getString(KEY_PASSWORD_HASH, null) ?: return null
+        } ?: return false
+        val expected = prefs.getString(KEY_PASSWORD_HASH, null) ?: return false
         // Upgrade passwords saved by the earlier debug build after successful verification.
         val legacy = !expected.startsWith(PASSWORD_PREFIX)
         val iterations = if (legacy) PASSWORD_ITERATIONS else expected.split(':').getOrNull(1)
-            ?.toIntOrNull()?.takeIf { it in 10_000..1_000_000 } ?: return null
+            ?.toIntOrNull()?.takeIf { it in 10_000..1_000_000 } ?: return false
         val actual = if (legacy) Base64.getEncoder().encodeToString(
             MessageDigest.getInstance("SHA-256").digest(salt + password.toByteArray(Charsets.UTF_8))
         ) else hashPassword(password, salt, iterations)
-        if (!constantTimeEquals(expected, actual)) return loginFailed()
-        if ((legacy || iterations != PASSWORD_ITERATIONS) && !setPassword(password)) return null
-        failedLogins = 0
-        nextLoginAllowedAt = 0L
-        return createToken()
-    }
-
-    private fun loginFailed(): String? {
-        failedLogins = (failedLogins + 1).coerceAtMost(6)
-        nextLoginAllowedAt = now() + (1_000L shl (failedLogins - 1))
-        return null
+        if (!constantTimeEquals(expected, actual)) return false
+        return !(legacy || iterations != PASSWORD_ITERATIONS) || setPassword(password)
     }
 
     @Synchronized
@@ -110,12 +109,20 @@ class PairingManager internal constructor(
         return constantTimeEquals(expected, hash(key))
     }
 
+    fun claim(code: String): String? = attemptClaim(code).token
+
     @Synchronized
-    fun claim(code: String): String? {
-        if (code != pairingCode || now() >= pairingExpiresAt) return null
+    internal fun attemptClaim(code: String): AuthenticationResult {
+        val remaining = pairingThrottle.remainingSeconds()
+        if (remaining > 0) return AuthenticationResult(retryAfterSeconds = remaining, rateLimited = true)
+        val expected = pairingCode
+        if (expected == null || code.length != 6 || !constantTimeEquals(code, expected) || now() >= pairingExpiresAt) {
+            return pairingThrottle.failed()
+        }
         pairingCode = null
         pairingExpiresAt = 0L
-        return createToken()
+        pairingThrottle.clear()
+        return AuthenticationResult(token = createToken())
     }
 
     fun isAuthorized(token: String?): Boolean =

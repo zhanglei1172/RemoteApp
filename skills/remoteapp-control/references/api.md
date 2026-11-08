@@ -34,7 +34,7 @@
 
 ## 登录、配对和会话
 
-密码通过 `REMOTEAPP_PASSWORD` 或 `login --password-file file` 提供；保留密码中的空格和换行，文件应只包含准确密码。配对码通过 `REMOTEAPP_PAIRING_CODE` 或 `pair --code-file file` 提供。登录失败有 1–32 秒退避，不通过重复尝试来探测密码。
+密码通过 `REMOTEAPP_PASSWORD` 或 `login --password-file file` 提供；保留密码中的空格和换行，文件应只包含准确密码。配对码通过 `REMOTEAPP_PAIRING_CODE` 或 `pair --code-file file` 提供。密码和配对码分别限速：前4次错误等待1/2/4/8秒，第5次冻结300秒，跨进程重启保留。401或429响应的`retryAfterSeconds`/`Retry-After`表示剩余秒数；429 AUTH_RATE_LIMITED时停止自动尝试，等待用户修正凭据，不能通过生成新配对码、切换地址或重启绕过。已有会话和Key仍可使用，不通过重复尝试来探测密码。
 
 ```bash
 python3 <skill-dir>/scripts/remoteapp.py --url IP:PORT login --password-file /private/path/password --save-session /private/path/session

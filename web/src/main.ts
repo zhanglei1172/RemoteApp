@@ -360,10 +360,31 @@ async function transferClipboard(write: boolean) {
   }
 }
 
+const authenticationCooldowns = new Map<string, number>();
+
+async function showAuthenticationFailure(response: Response, button: HTMLButtonElement, message: HTMLElement, fallback: string) {
+  const data = await response.json().catch(() => ({}));
+  const seconds = Number(data.retryAfterSeconds ?? response.headers.get("Retry-After"));
+  if (!Number.isFinite(seconds) || seconds <= 0) { message.textContent = fallback; return; }
+  const until = Date.now() + seconds * 1000;
+  authenticationCooldowns.set(button.id, until);
+  const update = () => {
+    const remaining = Math.max(0, Math.ceil((until - Date.now()) / 1000));
+    button.disabled = remaining > 0;
+    message.textContent = remaining > 0
+      ? `认证失败或尝试过于频繁，${remaining} 秒后可重试。`
+      : "等待已结束，可以重新尝试。";
+    if (remaining === 0) { authenticationCooldowns.delete(button.id); clearInterval(timer); }
+  };
+  const timer = window.setInterval(update, 1000);
+  update();
+}
+
 async function login() {
   const input = document.querySelector<HTMLInputElement>("#password")!;
   const button = document.querySelector<HTMLButtonElement>("#login")!;
   const message = document.querySelector<HTMLParagraphElement>("#loginMessage")!;
+  if (button.disabled) return;
   button.disabled = true;
   message.textContent = "正在登录…";
   try {
@@ -372,7 +393,7 @@ async function login() {
       body: JSON.stringify({ password: input.value }),
     });
     if (!response.ok) {
-      message.textContent = "密码错误或尝试过于频繁，请稍后重试。";
+      await showAuthenticationFailure(response, button, message, "密码错误，请检查后重试。");
       return;
     }
     const data = await response.json() as { token: string };
@@ -383,7 +404,7 @@ async function login() {
   } catch {
     message.textContent = "无法连接设备，请检查地址和网络。";
   } finally {
-    button.disabled = false;
+    button.disabled = (authenticationCooldowns.get(button.id) ?? 0) > Date.now();
   }
 }
 
@@ -391,6 +412,7 @@ async function pair() {
   const code = document.querySelector<HTMLInputElement>("#code")!.value;
   const button = document.querySelector<HTMLButtonElement>("#pair")!;
   const message = document.querySelector<HTMLParagraphElement>("#pairMessage")!;
+  if (button.disabled) return;
   if (!/^\d{6}$/.test(code)) {
     message.textContent = "请输入 6 位数字配对码。";
     return;
@@ -400,7 +422,7 @@ async function pair() {
   try {
     const response = await api("/api/v1/pairing/claim", { method: "POST", body: JSON.stringify({ code }) });
     if (!response.ok) {
-      message.textContent = "配对失败，请检查配对码和网络。";
+      await showAuthenticationFailure(response, button, message, "配对失败，请检查配对码和网络。");
       return;
     }
     const data = await response.json() as { token: string };
@@ -409,7 +431,7 @@ async function pair() {
   } catch {
     message.textContent = "无法连接设备，请检查地址和网络。";
   } finally {
-    button.disabled = false;
+    button.disabled = (authenticationCooldowns.get(button.id) ?? 0) > Date.now();
   }
 }
 

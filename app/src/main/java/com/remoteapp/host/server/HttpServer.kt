@@ -297,21 +297,13 @@ class HttpServer(
             }
             post("/api/v1/pairing/claim") {
                 val request = call.receive<PairingRequest>()
-                val token = RemoteRuntime.pairingManager.claim(request.code.trim())
-                if (token == null) {
-                    call.respondError(HttpStatusCode.Unauthorized, "PAIRING_FAILED", "The pairing code is invalid or expired")
-                } else {
-                    call.respond(PairingResponse(token, 0))
-                }
+                val result = withContext(Dispatchers.IO) { RemoteRuntime.pairingManager.attemptClaim(request.code.trim()) }
+                call.respondAuthentication(result, "PAIRING_FAILED")
             }
             post("/api/v1/auth/login") {
                 val request = call.receive<PasswordLoginRequest>()
-                val token = withContext(Dispatchers.IO) { RemoteRuntime.pairingManager.login(request.password) }
-                if (token == null) {
-                    call.respondError(HttpStatusCode.Unauthorized, "AUTH_FAILED", "The password is invalid or login is temporarily rate limited")
-                } else {
-                    call.respond(PairingResponse(token, 0))
-                }
+                val result = withContext(Dispatchers.IO) { RemoteRuntime.pairingManager.attemptLogin(request.password) }
+                call.respondAuthentication(result, "AUTH_FAILED")
             }
             post("/api/v1/stream-ticket") {
                 if (!call.authorized()) return@post
@@ -471,6 +463,22 @@ class HttpServer(
 
     private fun io.ktor.server.application.ApplicationCall.bearerToken(): String? =
         credential()?.takeUnless { it.apiKey }?.value
+
+    private suspend fun io.ktor.server.application.ApplicationCall.respondAuthentication(
+        result: com.remoteapp.host.auth.AuthenticationResult,
+        failureCode: String,
+    ) {
+        val token = result.token
+        if (token != null) {
+            respond(PairingResponse(token, 0))
+            return
+        }
+        if (result.retryAfterSeconds > 0) response.headers.append(HttpHeaders.RetryAfter, result.retryAfterSeconds.toString())
+        respond(if (result.rateLimited) HttpStatusCode.TooManyRequests else HttpStatusCode.Unauthorized,
+            ErrorResponse(if (result.rateLimited) "AUTH_RATE_LIMITED" else failureCode,
+                "Authentication failed; wait before trying again", UUID.randomUUID().toString(),
+                result.retryAfterSeconds.takeIf { it > 0 }))
+    }
 
     private suspend fun io.ktor.server.application.ApplicationCall.respondError(status: HttpStatusCode, error: String, message: String) {
         respond(status, ErrorResponse(error, message, UUID.randomUUID().toString()))

@@ -14,6 +14,76 @@ class PairingManagerTest {
     private fun manager() = PairingManager(prefs) { time }
 
     @Test
+    fun passwordFreezePersistsAndBlockedAttemptsDoNotExtendItOrInvalidateCredentials() {
+        var auth = manager()
+        auth.setPassword("existing-password")
+        val session = auth.login("existing-password")!!
+        val key = auth.generateApiKey()
+        for (seconds in listOf(1L, 2L, 4L, 8L, 300L)) {
+            val failure = auth.attemptLogin("incorrect-password")
+            assertNull(failure.token)
+            assertEquals(seconds, failure.retryAfterSeconds)
+            assertEquals(seconds == 300L, failure.rateLimited)
+            auth = manager() // Process/service restart cannot clear the failed-attempt count.
+            if (seconds != 300L) time += seconds * 1_000
+        }
+        repeat(20) { assertEquals(300L, auth.attemptLogin("existing-password").retryAfterSeconds) }
+        assertTrue(auth.isAuthorized(session))
+        assertTrue(auth.isApiKeyAuthorized(key))
+        time += 299_001
+        assertEquals(1L, auth.attemptLogin("existing-password").retryAfterSeconds)
+        time += 999
+        assertNotNull(auth.attemptLogin("existing-password").token)
+        assertEquals(1L, auth.attemptLogin("incorrect-password").retryAfterSeconds)
+    }
+
+    @Test
+    fun pairingFreezeCannotBeBypassedByNewCodeAndDoesNotBlockPasswordLogin() {
+        val auth = manager()
+        auth.setPassword("existing-password")
+        auth.createPairingCode()
+        for (seconds in listOf(1L, 2L, 4L, 8L, 300L)) {
+            assertEquals(seconds, auth.attemptClaim("000000").retryAfterSeconds)
+            if (seconds != 300L) time += seconds * 1_000
+        }
+        val fresh = auth.createPairingCode()
+        assertEquals(300L, auth.attemptClaim(fresh).retryAfterSeconds)
+        assertNotNull(auth.attemptLogin("existing-password").token)
+        time += 300_000
+        // The old code expires during the freeze; phone-side generation grants no reset.
+        val newCode = auth.createPairingCode()
+        assertNotNull(auth.attemptClaim(newCode).token)
+        assertNull(auth.attemptClaim(newCode).token)
+    }
+
+    @Test
+    fun quietWindowAndLocalPasswordReplacementResetOnlyPasswordFailures() {
+        val auth = manager()
+        auth.setPassword("existing-password")
+        assertEquals(1L, auth.attemptLogin("bad").retryAfterSeconds)
+        time += 15 * 60_000L
+        assertEquals(1L, auth.attemptLogin("bad").retryAfterSeconds)
+        auth.attemptClaim("000000")
+        assertTrue(auth.setPassword("replacement-password"))
+        assertNotNull(auth.attemptLogin("replacement-password").token)
+        assertTrue(auth.attemptClaim("000000").rateLimited)
+    }
+
+    @Test
+    fun parallelPairingGuessesShareOneCooldown() {
+        val auth = manager()
+        auth.createPairingCode()
+        val results = java.util.Collections.synchronizedList(mutableListOf<AuthenticationResult>())
+        val workers = List(12) { Thread { results.add(auth.attemptClaim("000000")) } }
+        workers.forEach(Thread::start)
+        workers.forEach(Thread::join)
+        assertEquals(1, results.count { !it.rateLimited })
+        assertTrue(results.all { it.token == null && it.retryAfterSeconds == 1L })
+        time += 1_000
+        assertEquals(2L, auth.attemptClaim("000000").retryAfterSeconds)
+    }
+
+    @Test
     fun passwordLoginPersistsAndRejectsIncorrectOrOversizedPasswords() {
         val auth = manager()
         assertNull(auth.login("test-password"))

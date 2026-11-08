@@ -375,6 +375,7 @@ private fun RemoteAppScreen(
                     else "设置 6-128 位密码，即可在网页中登录；也可使用一次性配对码。",
                     style = MaterialTheme.typography.bodySmall
                 )
+                Text("密码与配对码分别限速：错误后需等待，连续 5 次错误冻结 5 分钟；重启不会解除。", style = MaterialTheme.typography.bodySmall)
                 OutlinedTextField(
                     value = password,
                     onValueChange = onPasswordChanged,

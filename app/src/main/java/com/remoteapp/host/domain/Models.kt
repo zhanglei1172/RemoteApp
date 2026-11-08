@@ -6,7 +6,8 @@ import kotlinx.serialization.Serializable
 data class ErrorResponse(
     val error: String,
     val message: String,
-    val requestId: String
+    val requestId: String,
+    val retryAfterSeconds: Long? = null,
 )
 
 @Serializable

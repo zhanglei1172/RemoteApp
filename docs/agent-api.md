@@ -115,3 +115,8 @@ Android 10+ 读取要求 RemoteApp 窗口位于手机前台并具有焦点，否
 `GET /api/v1/files`列出传输副本和额度；`POST /api/v1/files?name=URL编码文件名`以原始二进制上传，返回201及`id/name/size/createdAt`；`GET /api/v1/files/{id}`下载，`DELETE`移除副本。全部沿用现有认证。手机文件需先在App“从手机选择文件”中导入，收到的副本可“保存到手机”另存；不存在任意手机路径接口。
 
 单文件100MiB、总量512MiB、256个文件，2路上传/2路下载；失败上传清理，下载端应校验Content-Length并清理半成品。网页用`POST /files/{id}/download-ticket`换取绑定文件/凭据的30秒单次票据，原生下载`GET /file-download/{ticket}`。上传必须提供准确的Content-Length；缺少返回411 LENGTH_REQUIRED，长度无效或截断返回400 INVALID_FILE_LENGTH/INCOMPLETE_UPLOAD，不发布副本。错误另含400 INVALID_FILENAME、404 FILE_NOT_FOUND、413 FILE_TOO_LARGE、429 TRANSFER_BUSY、507 TRANSFER_LIMIT/STORAGE_FULL/STORAGE_UNAVAILABLE。Skill专用命令流式处理大文件，详见[文件传输](../skills/remoteapp-control/references/files.md)。
+
+
+## 认证错误冷却
+
+密码登录和配对码各自独立、全设备共享失败计数，前4次错误冷却1/2/4/8秒，第5次冻结300秒。前4次静默15分钟或成功后清零；300秒冻结到期重新计数。初次错误401 AUTH_FAILED/PAIRING_FAILED，冷却期间及第5次错误429 AUTH_RATE_LIMITED，均可包含`Retry-After`头和`retryAfterSeconds`字段。冷却中即使提供正确凭据也被拒绝，请等待后手动尝试；重复请求不会延长冻结。进程重启、切换IP、生成新配对码不能解除冻结。已有Key/会话不受影响，不要因登录被冻结而轮换Key或撤销会话。
